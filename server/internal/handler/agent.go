@@ -1,9 +1,18 @@
 package handler
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -98,27 +107,44 @@ type RepoData struct {
 }
 
 type AgentTaskResponse struct {
-	ID             string         `json:"id"`
-	AgentID        string         `json:"agent_id"`
-	RuntimeID      string         `json:"runtime_id"`
-	IssueID        string         `json:"issue_id"`
-	WorkspaceID    string         `json:"workspace_id"`
-	Status         string         `json:"status"`
-	Priority       int32          `json:"priority"`
-	DispatchedAt   *string        `json:"dispatched_at"`
-	StartedAt      *string        `json:"started_at"`
-	CompletedAt    *string        `json:"completed_at"`
-	Result         any            `json:"result"`
-	Error          *string        `json:"error"`
-	Agent          *TaskAgentData `json:"agent,omitempty"`
-	Repos          []RepoData     `json:"repos,omitempty"`
-	CreatedAt      string         `json:"created_at"`
-	PriorSessionID   string         `json:"prior_session_id,omitempty"`    // session ID from a previous task on same issue
-	PriorWorkDir     string         `json:"prior_work_dir,omitempty"`     // work_dir from a previous task on same issue
+	ID                    string         `json:"id"`
+	AgentID               string         `json:"agent_id"`
+	RuntimeID             string         `json:"runtime_id"`
+	IssueID               string         `json:"issue_id"`
+	WorkspaceID           string         `json:"workspace_id"`
+	Status                string         `json:"status"`
+	Priority              int32          `json:"priority"`
+	DispatchedAt          *string        `json:"dispatched_at"`
+	StartedAt             *string        `json:"started_at"`
+	CompletedAt           *string        `json:"completed_at"`
+	Result                any            `json:"result"`
+	Error                 *string        `json:"error"`
+	Agent                 *TaskAgentData `json:"agent,omitempty"`
+	Repos                 []RepoData     `json:"repos,omitempty"`
+	CreatedAt             string         `json:"created_at"`
+	SessionID             string         `json:"session_id,omitempty"`              // concrete session id from this task run
+	WorkDir               string         `json:"work_dir,omitempty"`                // concrete work dir from this task run
+	PriorSessionID        string         `json:"prior_session_id,omitempty"`        // session ID from a previous task on same issue
+	PriorWorkDir          string         `json:"prior_work_dir,omitempty"`          // work_dir from a previous task on same issue
 	TriggerCommentID      *string        `json:"trigger_comment_id,omitempty"`      // comment that triggered this task
 	TriggerCommentContent string         `json:"trigger_comment_content,omitempty"` // content of the triggering comment
 	ChatSessionID         string         `json:"chat_session_id,omitempty"`         // non-empty for chat tasks
 	ChatMessage           string         `json:"chat_message,omitempty"`            // user message for chat tasks
+}
+
+type ExternalSessionResponse struct {
+	SessionID    string `json:"session_id"`
+	WorkDir      string `json:"work_dir,omitempty"`
+	LastSeenAt   string `json:"last_seen_at"`
+	IssueID      string `json:"issue_id,omitempty"`
+	SourceTaskID string `json:"source_task_id,omitempty"`
+}
+
+type ResumeExternalSessionRequest struct {
+	SessionID string `json:"session_id"`
+	WorkDir   string `json:"work_dir"`
+	IssueID   string `json:"issue_id"`
+	Priority  *int32 `json:"priority,omitempty"`
 }
 
 // TaskAgentData holds agent info included in claim responses so the daemon
@@ -132,25 +158,51 @@ type TaskAgentData struct {
 	CustomArgs   []string                 `json:"custom_args,omitempty"`
 }
 
+type codexSessionMetaEvent struct {
+	Type    string `json:"type"`
+	Payload struct {
+		ID      string `json:"id"`
+		Cwd     string `json:"cwd"`
+		WorkDir string `json:"work_dir"`
+	} `json:"payload"`
+}
+
+type codexSessionRecord struct {
+	SessionID  string
+	WorkDir    string
+	LastSeenAt time.Time
+}
+
+const (
+	defaultExternalSessionLookbackDays = 7
+	maxExternalSessionLookbackDays     = 30
+	defaultManualResumePriority        = 50
+)
+
+var rolloutSessionIDPattern = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+
 func taskToResponse(t db.AgentTaskQueue) AgentTaskResponse {
 	var result any
 	if t.Result != nil {
 		json.Unmarshal(t.Result, &result)
 	}
 	return AgentTaskResponse{
-		ID:           uuidToString(t.ID),
-		AgentID:      uuidToString(t.AgentID),
-		RuntimeID:    uuidToString(t.RuntimeID),
-		IssueID:      uuidToString(t.IssueID),
-		Status:       t.Status,
-		Priority:     t.Priority,
-		DispatchedAt: timestampToPtr(t.DispatchedAt),
-		StartedAt:    timestampToPtr(t.StartedAt),
-		CompletedAt:  timestampToPtr(t.CompletedAt),
-		Result:       result,
+		ID:               uuidToString(t.ID),
+		AgentID:          uuidToString(t.AgentID),
+		RuntimeID:        uuidToString(t.RuntimeID),
+		IssueID:          uuidToString(t.IssueID),
+		Status:           t.Status,
+		Priority:         t.Priority,
+		DispatchedAt:     timestampToPtr(t.DispatchedAt),
+		StartedAt:        timestampToPtr(t.StartedAt),
+		CompletedAt:      timestampToPtr(t.CompletedAt),
+		Result:           result,
 		Error:            textToPtr(t.Error),
 		CreatedAt:        timestampToString(t.CreatedAt),
+		SessionID:        t.SessionID.String,
+		WorkDir:          t.WorkDir.String,
 		TriggerCommentID: uuidToPtr(t.TriggerCommentID),
+		ChatSessionID:    uuidToString(t.ChatSessionID),
 	}
 }
 
@@ -335,8 +387,6 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 	h.publish(protocol.EventAgentCreated, workspaceID, actorType, actorID, map[string]any{"agent": resp})
 	writeJSON(w, http.StatusCreated, resp)
 }
-
-
 
 type UpdateAgentRequest struct {
 	Name               *string            `json:"name"`
@@ -558,4 +608,401 @@ func (h *Handler) ListAgentTasks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) ResumeAgentTask(w http.ResponseWriter, r *http.Request) {
+	agentID := chi.URLParam(r, "id")
+	sourceTaskID := chi.URLParam(r, "taskId")
+
+	agent, ok := h.loadAgentForUser(w, r, agentID)
+	if !ok {
+		return
+	}
+
+	sourceTask, err := h.Queries.GetAgentTask(r.Context(), parseUUID(sourceTaskID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "source task not found")
+		return
+	}
+
+	if uuidToString(sourceTask.AgentID) != agentID {
+		writeError(w, http.StatusForbidden, "task does not belong to this agent")
+		return
+	}
+	if sourceTask.Status != "completed" {
+		writeError(w, http.StatusBadRequest, "only completed tasks can be resumed")
+		return
+	}
+	if !sourceTask.IssueID.Valid {
+		writeError(w, http.StatusBadRequest, "only issue tasks can be resumed")
+		return
+	}
+	if !sourceTask.SessionID.Valid || sourceTask.SessionID.String == "" {
+		writeError(w, http.StatusBadRequest, "source task has no resumable session")
+		return
+	}
+	if !agent.RuntimeID.Valid {
+		writeError(w, http.StatusConflict, "agent has no runtime")
+		return
+	}
+	if h.DB == nil {
+		writeError(w, http.StatusInternalServerError, "database executor unavailable")
+		return
+	}
+
+	hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(r.Context(), db.HasPendingTaskForIssueAndAgentParams{
+		IssueID: sourceTask.IssueID,
+		AgentID: sourceTask.AgentID,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check pending tasks")
+		return
+	}
+	if hasPending {
+		writeError(w, http.StatusConflict, "there is already a pending task for this issue")
+		return
+	}
+
+	newTask, err := h.Queries.CreateAgentTask(r.Context(), db.CreateAgentTaskParams{
+		AgentID:   sourceTask.AgentID,
+		RuntimeID: agent.RuntimeID,
+		IssueID:   sourceTask.IssueID,
+		Priority:  sourceTask.Priority,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to enqueue resume task")
+		return
+	}
+
+	resumeContext := map[string]any{
+		"resume_session_id":   sourceTask.SessionID.String,
+		"resume_source_task":  sourceTaskID,
+		"resume_source_agent": agentID,
+	}
+	if sourceTask.WorkDir.Valid && sourceTask.WorkDir.String != "" {
+		resumeContext["resume_work_dir"] = sourceTask.WorkDir.String
+	}
+
+	ctxJSON, err := json.Marshal(resumeContext)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to encode resume context")
+		return
+	}
+
+	if _, err := h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context = $2 WHERE id = $1`, newTask.ID, ctxJSON); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save resume context")
+		return
+	}
+	newTask.Context = ctxJSON
+
+	writeJSON(w, http.StatusCreated, taskToResponse(newTask))
+}
+
+func (h *Handler) ListAgentExternalSessions(w http.ResponseWriter, r *http.Request) {
+	agentID := chi.URLParam(r, "id")
+	agent, ok := h.loadAgentForUser(w, r, agentID)
+	if !ok {
+		return
+	}
+	if !agent.RuntimeID.Valid {
+		writeJSON(w, http.StatusOK, []ExternalSessionResponse{})
+		return
+	}
+
+	runtime, err := h.Queries.GetAgentRuntime(r.Context(), agent.RuntimeID)
+	if err == nil && runtime.Provider != "codex" {
+		writeJSON(w, http.StatusOK, []ExternalSessionResponse{})
+		return
+	}
+
+	root := resolveCodexSessionRoot()
+	if root == "" {
+		writeJSON(w, http.StatusOK, []ExternalSessionResponse{})
+		return
+	}
+
+	days := parseLookbackDays(r.URL.Query().Get("days"))
+	external, err := scanCodexSessions(root, days)
+	if err != nil {
+		slog.Warn("scan codex sessions failed", append(logger.RequestAttrs(r), "error", err, "root", root)...)
+		writeJSON(w, http.StatusOK, []ExternalSessionResponse{})
+		return
+	}
+
+	taskRows, err := h.Queries.ListAgentTasks(r.Context(), parseUUID(agentID))
+	if err == nil {
+		latestBySession := map[string]db.AgentTaskQueue{}
+		for _, task := range taskRows {
+			if !task.SessionID.Valid || task.SessionID.String == "" {
+				continue
+			}
+			sid := task.SessionID.String
+			if cur, exists := latestBySession[sid]; !exists || taskReferenceTime(task).After(taskReferenceTime(cur)) {
+				latestBySession[sid] = task
+			}
+		}
+
+		for i := range external {
+			if task, exists := latestBySession[external[i].SessionID]; exists {
+				external[i].IssueID = uuidToString(task.IssueID)
+				external[i].SourceTaskID = uuidToString(task.ID)
+				if external[i].WorkDir == "" && task.WorkDir.Valid {
+					external[i].WorkDir = task.WorkDir.String
+				}
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, external)
+}
+
+func (h *Handler) ResumeExternalSession(w http.ResponseWriter, r *http.Request) {
+	agentID := chi.URLParam(r, "id")
+	agent, ok := h.loadAgentForUser(w, r, agentID)
+	if !ok {
+		return
+	}
+	if !agent.RuntimeID.Valid {
+		writeError(w, http.StatusConflict, "agent has no runtime")
+		return
+	}
+	if h.DB == nil {
+		writeError(w, http.StatusInternalServerError, "database executor unavailable")
+		return
+	}
+
+	var req ResumeExternalSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	req.WorkDir = strings.TrimSpace(req.WorkDir)
+	req.IssueID = strings.TrimSpace(req.IssueID)
+	if req.SessionID == "" {
+		writeError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+
+	issueID := pgtype.UUID{}
+	if req.IssueID != "" {
+		issueID = parseUUID(req.IssueID)
+		if !issueID.Valid {
+			writeError(w, http.StatusBadRequest, "invalid issue_id")
+			return
+		}
+		if _, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+			ID:          issueID,
+			WorkspaceID: agent.WorkspaceID,
+		}); err != nil {
+			writeError(w, http.StatusBadRequest, "issue_id does not belong to this workspace")
+			return
+		}
+
+		hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(r.Context(), db.HasPendingTaskForIssueAndAgentParams{
+			IssueID: issueID,
+			AgentID: parseUUID(agentID),
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to check pending tasks")
+			return
+		}
+		if hasPending {
+			writeError(w, http.StatusConflict, "there is already a pending task for this issue")
+			return
+		}
+	}
+
+	priority := int32(defaultManualResumePriority)
+	if req.Priority != nil {
+		priority = *req.Priority
+	}
+
+	newTask, err := h.Queries.CreateAgentTask(r.Context(), db.CreateAgentTaskParams{
+		AgentID:   parseUUID(agentID),
+		RuntimeID: agent.RuntimeID,
+		IssueID:   issueID,
+		Priority:  priority,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to enqueue resume task")
+		return
+	}
+
+	resumeContext := map[string]any{
+		"resume_session_id": req.SessionID,
+		"resume_source":     "external_codex_session",
+	}
+	if req.WorkDir != "" {
+		resumeContext["resume_work_dir"] = req.WorkDir
+	}
+	if !issueID.Valid {
+		resumeContext["resume_manual"] = true
+	}
+
+	ctxJSON, err := json.Marshal(resumeContext)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to encode resume context")
+		return
+	}
+	if _, err := h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context = $2 WHERE id = $1`, newTask.ID, ctxJSON); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save resume context")
+		return
+	}
+	newTask.Context = ctxJSON
+
+	writeJSON(w, http.StatusCreated, taskToResponse(newTask))
+}
+
+func parseLookbackDays(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultExternalSessionLookbackDays
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultExternalSessionLookbackDays
+	}
+	if n > maxExternalSessionLookbackDays {
+		return maxExternalSessionLookbackDays
+	}
+	return n
+}
+
+func resolveCodexSessionRoot() string {
+	candidates := []string{
+		strings.TrimSpace(os.Getenv("MULTICA_CODEX_SESSIONS_ROOT")),
+		strings.TrimSpace(os.Getenv("CODEX_SESSION_DIR")),
+	}
+	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+		candidates = append(candidates, filepath.Join(codexHome, "sessions"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates = append(candidates, filepath.Join(home, ".codex", "sessions"))
+	}
+
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		info, err := os.Stat(candidate)
+		if err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func scanCodexSessions(root string, days int) ([]ExternalSessionResponse, error) {
+	now := time.Now()
+	cutoff := now.Add(-time.Duration(days) * 24 * time.Hour)
+	bySessionID := map[string]codexSessionRecord{}
+
+	for offset := 0; offset < days; offset++ {
+		day := now.AddDate(0, 0, -offset)
+		dayDir := filepath.Join(root,
+			fmt.Sprintf("%04d", day.Year()),
+			fmt.Sprintf("%02d", int(day.Month())),
+			fmt.Sprintf("%02d", day.Day()),
+		)
+
+		files, err := filepath.Glob(filepath.Join(dayDir, "*.jsonl"))
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range files {
+			record, ok := parseCodexSessionFile(f)
+			if !ok || record.SessionID == "" {
+				continue
+			}
+			if record.LastSeenAt.Before(cutoff) {
+				continue
+			}
+			if cur, exists := bySessionID[record.SessionID]; !exists || record.LastSeenAt.After(cur.LastSeenAt) {
+				bySessionID[record.SessionID] = record
+			}
+		}
+	}
+
+	result := make([]ExternalSessionResponse, 0, len(bySessionID))
+	for _, record := range bySessionID {
+		result = append(result, ExternalSessionResponse{
+			SessionID:  record.SessionID,
+			WorkDir:    record.WorkDir,
+			LastSeenAt: record.LastSeenAt.UTC().Format(time.RFC3339),
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].LastSeenAt > result[j].LastSeenAt
+	})
+	return result, nil
+}
+
+func parseCodexSessionFile(path string) (codexSessionRecord, bool) {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return codexSessionRecord{}, false
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return codexSessionRecord{}, false
+	}
+	defer f.Close()
+
+	record := codexSessionRecord{
+		LastSeenAt: stat.ModTime(),
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.Contains(line, `"session_meta"`) {
+			continue
+		}
+
+		var evt codexSessionMetaEvent
+		if err := json.Unmarshal([]byte(line), &evt); err != nil || evt.Type != "session_meta" {
+			continue
+		}
+
+		record.SessionID = strings.TrimSpace(evt.Payload.ID)
+		record.WorkDir = strings.TrimSpace(evt.Payload.Cwd)
+		if record.WorkDir == "" {
+			record.WorkDir = strings.TrimSpace(evt.Payload.WorkDir)
+		}
+		if record.SessionID != "" {
+			return record, true
+		}
+	}
+
+	record.SessionID = sessionIDFromRolloutFilename(path)
+	if record.SessionID != "" {
+		return record, true
+	}
+
+	return codexSessionRecord{}, false
+}
+
+func sessionIDFromRolloutFilename(path string) string {
+	base := filepath.Base(path)
+	return rolloutSessionIDPattern.FindString(base)
+}
+
+func taskReferenceTime(task db.AgentTaskQueue) time.Time {
+	if task.CompletedAt.Valid {
+		return task.CompletedAt.Time
+	}
+	if task.StartedAt.Valid {
+		return task.StartedAt.Time
+	}
+	if task.DispatchedAt.Valid {
+		return task.DispatchedAt.Time
+	}
+	if task.CreatedAt.Valid {
+		return task.CreatedAt.Time
+	}
+	return time.Time{}
 }
