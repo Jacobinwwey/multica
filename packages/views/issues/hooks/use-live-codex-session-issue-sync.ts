@@ -93,6 +93,7 @@ export function useLiveCodexSessionIssueSync() {
     const syncLiveSessions = async () => {
       if (cancelled) return;
       if (agents.length === 0) return;
+      if (!user?.id) return;
 
       const activeAgents = agents.filter((a) => !a.archived_at);
       if (activeAgents.length === 0) return;
@@ -193,8 +194,8 @@ export function useLiveCodexSessionIssueSync() {
                   `Workdir: ${candidate.workDir || "(unknown)"}`,
                 status: "todo",
                 priority: "none",
-                assignee_type: user?.id ? "member" : "agent",
-                assignee_id: user?.id || candidate.agentId,
+                assignee_type: "member",
+                assignee_id: user.id,
               });
               issueId = created.id;
               createdCount += 1;
