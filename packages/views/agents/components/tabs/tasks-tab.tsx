@@ -166,7 +166,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
       } else {
         const selectedIssueId = issueBindingBySession[entry.session_id];
         const autoIssueId =
-          !entry.issue_id && !selectedIssueId && bindableIssues.length === 1
+          !entry.issue_id && !selectedIssueId && bindableIssues.length > 0
             ? bindableIssues[0]!.id
             : undefined;
         const effectiveIssueID = entry.issue_id || selectedIssueId || autoIssueId;
@@ -176,6 +176,12 @@ export function TasksTab({ agent }: { agent: Agent }) {
           work_dir: entry.work_dir,
           issue_id: effectiveIssueID,
         });
+        if (autoIssueId && autoIssueId === effectiveIssueID) {
+          const autoIssue = issueMap.get(autoIssueId);
+          if (autoIssue) {
+            toast.info(`Auto-bound to ${autoIssue.identifier} for issue visibility.`);
+          }
+        }
         if (!effectiveIssueID) {
           toast.info("This run is not bound to an issue, it will show in Tasks only.");
         }
