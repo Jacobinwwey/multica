@@ -13,8 +13,16 @@ import {
 import { ActorAvatar } from "../../common/actor-avatar";
 import { PageHeader } from "../../layout/page-header";
 import { ProviderLogo } from "./provider-logo";
+import { formatLastSeen } from "../utils";
 
 type RuntimeFilter = "mine" | "all";
+
+function isRuntimeSeenWithinDays(runtime: AgentRuntime, days: number): boolean {
+  if (!runtime.last_seen_at) return false;
+  const lastSeenMs = Date.parse(runtime.last_seen_at);
+  if (Number.isNaN(lastSeenMs)) return false;
+  return lastSeenMs >= Date.now() - days * 24 * 60 * 60 * 1000;
+}
 
 function RuntimeListItem({
   runtime,
@@ -55,11 +63,19 @@ function RuntimeListItem({
             <span className="truncate">{runtime.runtime_mode}</span>
           )}
         </div>
+        <div className="mt-0.5 text-[11px] text-muted-foreground">
+          Last seen {formatLastSeen(runtime.last_seen_at)}
+        </div>
       </div>
       <div className="flex items-center gap-1.5 shrink-0">
         {hasUpdate && (
           <span title="Update available">
             <ArrowUpCircle className="h-3.5 w-3.5 text-info" />
+          </span>
+        )}
+        {runtime.provider === "codex" && isRuntimeSeenWithinDays(runtime, 7) && (
+          <span className="rounded bg-success/15 px-1.5 py-0.5 text-[10px] font-medium text-success">
+            7d
           </span>
         )}
         <div
@@ -116,6 +132,9 @@ export function RuntimeList({
   const filteredRuntimes = filter === "all" && ownerFilter
     ? runtimes.filter((r) => r.owner_id === ownerFilter)
     : runtimes;
+  const codex7dCount = filteredRuntimes.filter(
+    (runtime) => runtime.provider === "codex" && isRuntimeSeenWithinDays(runtime, 7),
+  ).length;
 
   const selectedOwner = ownerFilter ? getOwnerMember(ownerFilter) : null;
 
@@ -125,7 +144,7 @@ export function RuntimeList({
         <h1 className="text-sm font-semibold">Runtimes</h1>
         <span className="text-xs text-muted-foreground">
           {filteredRuntimes.filter((r) => r.status === "online").length}/
-          {filteredRuntimes.length} online
+          {filteredRuntimes.length} online · {codex7dCount} codex 7d
         </span>
       </PageHeader>
 

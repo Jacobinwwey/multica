@@ -3,7 +3,11 @@
 import { useState, useEffect, useMemo } from "react";
 import { useDefaultLayout } from "react-resizable-panels";
 import { Bot, Plus, Archive } from "lucide-react";
-import type { CreateAgentRequest, UpdateAgentRequest } from "@multica/core/types";
+import type {
+  CreateAgentRequest,
+  RuntimeDevice,
+  UpdateAgentRequest,
+} from "@multica/core/types";
 import {
   ResizablePanelGroup,
   ResizablePanel,
@@ -23,6 +27,25 @@ import { CreateAgentDialog } from "./create-agent-dialog";
 import { AgentListItem } from "./agent-list-item";
 import { AgentDetail } from "./agent-detail";
 
+type AgentScopeFilter = "all" | "codex_7d" | "codex_3d";
+
+function isRecentCodexRuntime(
+  runtime: RuntimeDevice | undefined,
+  days: 3 | 7,
+): boolean {
+  if (!runtime || runtime.provider !== "codex" || !runtime.last_seen_at) {
+    return false;
+  }
+
+  const lastSeen = Date.parse(runtime.last_seen_at);
+  if (Number.isNaN(lastSeen)) {
+    return false;
+  }
+
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  return lastSeen >= cutoff;
+}
+
 export function AgentsPage() {
   const isLoading = useAuthStore((s) => s.isLoading);
   const currentUser = useAuthStore((s) => s.user);
@@ -31,6 +54,7 @@ export function AgentsPage() {
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
   const [selectedId, setSelectedId] = useState<string>("");
   const [showArchived, setShowArchived] = useState(false);
+  const [scopeFilter, setScopeFilter] = useState<AgentScopeFilter>("all");
   const [showCreate, setShowCreate] = useState(false);
   const { data: runtimes = [], isLoading: runtimesLoading } = useQuery(runtimeListOptions(wsId));
   const { data: members = [] } = useQuery(memberListOptions(wsId));
@@ -38,9 +62,27 @@ export function AgentsPage() {
     id: "multica_agents_layout",
   });
 
+  const runtimeByID = useMemo(
+    () => new Map(runtimes.map((runtime) => [runtime.id, runtime])),
+    [runtimes],
+  );
+
   const filteredAgents = useMemo(
-    () => showArchived ? agents.filter((a) => !!a.archived_at) : agents.filter((a) => !a.archived_at),
-    [agents, showArchived],
+    () => {
+      const base = showArchived
+        ? agents.filter((agent) => !!agent.archived_at)
+        : agents.filter((agent) => !agent.archived_at);
+
+      if (scopeFilter === "all") {
+        return base;
+      }
+
+      const days: 3 | 7 = scopeFilter === "codex_3d" ? 3 : 7;
+      return base.filter((agent) =>
+        isRecentCodexRuntime(runtimeByID.get(agent.runtime_id), days),
+      );
+    },
+    [agents, runtimeByID, scopeFilter, showArchived],
   );
 
   const archivedCount = useMemo(() => agents.filter((a) => !!a.archived_at).length, [agents]);
@@ -163,11 +205,54 @@ export function AgentsPage() {
               </Button>
             </div>
           </PageHeader>
+          <div className="flex items-center gap-0.5 border-b px-4 py-2">
+            <button
+              onClick={() => setScopeFilter("all")}
+              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                scopeFilter === "all"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
+              }`}
+            >
+              All
+            </button>
+            <button
+              onClick={() => setScopeFilter("codex_7d")}
+              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                scopeFilter === "codex_7d"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
+              }`}
+            >
+              Codex 7d
+            </button>
+            <button
+              onClick={() => setScopeFilter("codex_3d")}
+              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                scopeFilter === "codex_3d"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
+              }`}
+            >
+              Codex 3d
+            </button>
+            {scopeFilter !== "all" && (
+              <span className="ml-auto text-xs text-muted-foreground">
+                {filteredAgents.length} matched
+              </span>
+            )}
+          </div>
           {filteredAgents.length === 0 ? (
             <div className="flex flex-col items-center justify-center px-4 py-12">
               <Bot className="h-8 w-8 text-muted-foreground/40" />
               <p className="mt-3 text-sm text-muted-foreground">
-                {showArchived ? "No archived agents" : archivedCount > 0 ? "No active agents" : "No agents yet"}
+                {scopeFilter !== "all"
+                  ? "No Codex agents active in this time window"
+                  : showArchived
+                    ? "No archived agents"
+                    : archivedCount > 0
+                      ? "No active agents"
+                      : "No agents yet"}
               </p>
               {!showArchived && (
                 <Button
