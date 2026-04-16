@@ -37,6 +37,9 @@ export interface AgentTask {
   created_at: string;
   session_id?: string;
   work_dir?: string;
+  resume_session_id?: string;
+  resume_source?: string;
+  resume_command?: string;
   prior_session_id?: string;
   prior_work_dir?: string;
   chat_session_id?: string;

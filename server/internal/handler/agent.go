@@ -124,6 +124,9 @@ type AgentTaskResponse struct {
 	CreatedAt             string         `json:"created_at"`
 	SessionID             string         `json:"session_id,omitempty"`              // concrete session id from this task run
 	WorkDir               string         `json:"work_dir,omitempty"`                // concrete work dir from this task run
+	ResumeSessionID       string         `json:"resume_session_id,omitempty"`       // explicit session id selected for Continue/resume
+	ResumeSource          string         `json:"resume_source,omitempty"`           // source label (task/external/manual)
+	ResumeCommand         string         `json:"resume_command,omitempty"`          // ready-to-run command: codex resume <session_id>
 	PriorSessionID        string         `json:"prior_session_id,omitempty"`        // session ID from a previous task on same issue
 	PriorWorkDir          string         `json:"prior_work_dir,omitempty"`          // work_dir from a previous task on same issue
 	TriggerCommentID      *string        `json:"trigger_comment_id,omitempty"`      // comment that triggered this task
@@ -186,7 +189,13 @@ func taskToResponse(t db.AgentTaskQueue) AgentTaskResponse {
 	if t.Result != nil {
 		json.Unmarshal(t.Result, &result)
 	}
-	return AgentTaskResponse{
+	resumeSessionID, resumeSource := extractResumeMetadataFromTaskContext(t)
+	resumeCommand := ""
+	if resumeSessionID != "" {
+		resumeCommand = fmt.Sprintf("codex resume %s", resumeSessionID)
+	}
+
+	resp := AgentTaskResponse{
 		ID:               uuidToString(t.ID),
 		AgentID:          uuidToString(t.AgentID),
 		RuntimeID:        uuidToString(t.RuntimeID),
@@ -201,9 +210,37 @@ func taskToResponse(t db.AgentTaskQueue) AgentTaskResponse {
 		CreatedAt:        timestampToString(t.CreatedAt),
 		SessionID:        t.SessionID.String,
 		WorkDir:          t.WorkDir.String,
+		ResumeSessionID:  resumeSessionID,
+		ResumeSource:     resumeSource,
+		ResumeCommand:    resumeCommand,
 		TriggerCommentID: uuidToPtr(t.TriggerCommentID),
 		ChatSessionID:    uuidToString(t.ChatSessionID),
 	}
+	// Keep backward compatibility for clients that already read prior_session_id.
+	if resp.PriorSessionID == "" && resp.ResumeSessionID != "" {
+		resp.PriorSessionID = resp.ResumeSessionID
+	}
+
+	return resp
+}
+
+func extractResumeMetadataFromTaskContext(task db.AgentTaskQueue) (sessionID, source string) {
+	if len(task.Context) == 0 {
+		return "", ""
+	}
+
+	var taskCtx map[string]any
+	if err := json.Unmarshal(task.Context, &taskCtx); err != nil {
+		return "", ""
+	}
+
+	if rawSessionID, ok := taskCtx["resume_session_id"].(string); ok {
+		sessionID = strings.TrimSpace(rawSessionID)
+	}
+	if rawSource, ok := taskCtx["resume_source"].(string); ok {
+		source = strings.TrimSpace(rawSource)
+	}
+	return sessionID, source
 }
 
 func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {

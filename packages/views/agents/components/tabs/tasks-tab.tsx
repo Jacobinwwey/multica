@@ -26,6 +26,18 @@ function shortSessionId(sessionId: string): string {
   return `${sessionId.slice(0, 8)}...${sessionId.slice(-8)}`;
 }
 
+function resolveTaskResumeCommand(task: AgentTask): string | null {
+  const explicitCommand = (task.resume_command || "").trim();
+  if (explicitCommand) return explicitCommand;
+  const resumeSessionID = (
+    task.resume_session_id ||
+    task.prior_session_id ||
+    task.session_id ||
+    ""
+  ).trim();
+  return resumeSessionID ? `codex resume ${resumeSessionID}` : null;
+}
+
 export function TasksTab({ agent }: { agent: Agent }) {
   const [tasks, setTasks] = useState<AgentTask[]>([]);
   const [externalSessions, setExternalSessions] = useState<AgentExternalSession[]>([]);
@@ -316,11 +328,12 @@ export function TasksTab({ agent }: { agent: Agent }) {
             const issue = issueMap.get(task.issue_id);
             const isActive = task.status === "running" || task.status === "dispatched";
             const isRunning = task.status === "running";
+            const resumeCommand = resolveTaskResumeCommand(task);
             const issueTitle = issue
               ? issue.title
               : task.issue_id
                 ? `Issue ${task.issue_id.slice(0, 8)}...`
-                : "Manual resume session";
+                : resumeCommand ?? "Manual resume session";
 
             return (
               <div
@@ -360,6 +373,16 @@ export function TasksTab({ agent }: { agent: Agent }) {
                             ? `Failed ${new Date(task.completed_at).toLocaleString()}`
                             : `Queued ${new Date(task.created_at).toLocaleString()}`}
                   </div>
+                  {resumeCommand && (
+                    <div className="mt-1">
+                      <code
+                        className="inline-block max-w-full truncate rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+                        title={resumeCommand}
+                      >
+                        {resumeCommand}
+                      </code>
+                    </div>
+                  )}
                 </div>
                 <span className={`shrink-0 text-xs font-medium ${config.color}`}>
                   {config.label}
