@@ -25,8 +25,11 @@ import { useUpdateIssue, useLoadMoreDoneIssues } from "@multica/core/issues/muta
 import { myIssuesViewStore } from "@multica/core/issues/stores/my-issues-view-store";
 import { PageHeader } from "../../layout/page-header";
 import { MyIssuesHeader } from "./my-issues-header";
+import { useLiveCodexSessionIssueSync } from "../../issues/hooks/use-live-codex-session-issue-sync";
 
 export function MyIssuesPage() {
+  useLiveCodexSessionIssueSync();
+
   const user = useAuthStore((s) => s.user);
   const workspace = useCurrentWorkspace();
   const wsId = useWorkspaceId();

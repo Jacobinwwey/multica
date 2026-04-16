@@ -8,8 +8,8 @@ import { Button } from "@multica/ui/components/ui/button";
 import { api } from "@multica/core/api";
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
-import { issueListOptions } from "@multica/core/issues/queries";
-import { useQuery } from "@tanstack/react-query";
+import { issueKeys, issueListOptions } from "@multica/core/issues/queries";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { taskStatusConfig } from "../../config";
 
@@ -99,6 +99,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
   const workspaceReposReadyRef = useRef<boolean | null>(null);
   const missingReposWarnedRef = useRef(false);
   const wsId = useWorkspaceId();
+  const qc = useQueryClient();
   const currentUser = useAuthStore((s) => s.user);
   const { data: issues = [], isFetched: issuesFetched } = useQuery(issueListOptions(wsId));
 
@@ -354,6 +355,10 @@ export function TasksTab({ agent }: { agent: Agent }) {
               assignee_type: currentUser?.id ? "member" : undefined,
               assignee_id: currentUser?.id || undefined,
             });
+            await Promise.all([
+              qc.invalidateQueries({ queryKey: issueKeys.all(wsId) }),
+              qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) }),
+            ]);
             targetIssueID = createdIssue.id;
             sessionIssueCache.set(resumeSessionID, targetIssueID);
             createdIssueCount += 1;
@@ -383,6 +388,10 @@ export function TasksTab({ agent }: { agent: Agent }) {
               assignee_type: currentUser?.id ? "member" : undefined,
               assignee_id: currentUser?.id || undefined,
             });
+            await Promise.all([
+              qc.invalidateQueries({ queryKey: issueKeys.all(wsId) }),
+              qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) }),
+            ]);
             await api.bindAgentTaskIssue(agent.id, task.id, fallbackIssue.id);
             sessionIssueCache.set(resumeSessionID, fallbackIssue.id);
             createdIssueCount += 1;
@@ -418,6 +427,8 @@ export function TasksTab({ agent }: { agent: Agent }) {
     issuesFetched,
     currentUser?.id,
     ensureWorkspaceReposReady,
+    qc,
+    wsId,
   ]);
 
   const copySessionId = async (sessionId: string) => {
@@ -496,6 +507,10 @@ export function TasksTab({ agent }: { agent: Agent }) {
           assignee_type: currentUser?.id ? "member" : undefined,
           assignee_id: currentUser?.id || undefined,
         });
+        await Promise.all([
+          qc.invalidateQueries({ queryKey: issueKeys.all(wsId) }),
+          qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) }),
+        ]);
         effectiveIssueID = createdIssue.id;
         toast.info(`Auto-created ${createdIssue.identifier} for this resume task.`);
       }
@@ -526,6 +541,10 @@ export function TasksTab({ agent }: { agent: Agent }) {
           assignee_type: currentUser?.id ? "member" : undefined,
           assignee_id: currentUser?.id || undefined,
         });
+        await Promise.all([
+          qc.invalidateQueries({ queryKey: issueKeys.all(wsId) }),
+          qc.invalidateQueries({ queryKey: issueKeys.myAll(wsId) }),
+        ]);
         effectiveIssueID = createdIssue.id;
         toast.info(`Created ${createdIssue.identifier} due to pending-task conflict.`);
 

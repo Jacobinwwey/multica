@@ -22,8 +22,11 @@ import { IssuesHeader } from "./issues-header";
 import { BoardView } from "./board-view";
 import { ListView } from "./list-view";
 import { BatchActionToolbar } from "./batch-action-toolbar";
+import { useLiveCodexSessionIssueSync } from "../hooks/use-live-codex-session-issue-sync";
 
 export function IssuesPage() {
+  useLiveCodexSessionIssueSync();
+
   const wsId = useWorkspaceId();
   const { data: allIssues = [], isLoading: loading } = useQuery(issueListOptions(wsId));
 
