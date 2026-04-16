@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -149,5 +150,43 @@ func TestBindAgentTaskIssue_RejectsCompletedTask(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("BindAgentTaskIssue: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResumeExternalSession_RejectsWhenWorkspaceHasNoRepos(t *testing.T) {
+	ctx := context.Background()
+	agentID, _ := mustLookupHandlerTestAgent(t)
+	sessionID := "019d96b0-288d-7bc3-9488-275af8d26876"
+
+	req := newRequest("POST", "/api/agents/"+agentID+"/resume-session", map[string]any{
+		"session_id": sessionID,
+	})
+	req = withRouteParams(req, map[string]string{
+		"id": agentID,
+	})
+	w := httptest.NewRecorder()
+	testHandler.ResumeExternalSession(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("ResumeExternalSession: expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(w.Body.String()), "no repositories configured") {
+		t.Fatalf("ResumeExternalSession: expected no-repositories error, got %s", w.Body.String())
+	}
+
+	var createdCount int
+	if err := testPool.QueryRow(
+		ctx,
+		`SELECT count(*)
+		 FROM agent_task_queue
+		 WHERE agent_id = $1
+		   AND context->>'resume_session_id' = $2`,
+		agentID,
+		sessionID,
+	).Scan(&createdCount); err != nil {
+		t.Fatalf("query task count: %v", err)
+	}
+	if createdCount != 0 {
+		t.Fatalf("expected no resume task enqueued, got %d", createdCount)
 	}
 }

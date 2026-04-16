@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { ListTodo, RotateCcw, Copy } from "lucide-react";
 import type { Agent, AgentExternalSession, AgentTask } from "@multica/core/types";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
@@ -96,6 +96,8 @@ export function TasksTab({ agent }: { agent: Agent }) {
   const inFlightResumeSessionsRef = useRef<Set<string>>(new Set());
   const inFlightTaskIssueBindingsRef = useRef<Set<string>>(new Set());
   const attemptedTaskIssueBindingsRef = useRef<Set<string>>(new Set());
+  const workspaceReposReadyRef = useRef<boolean | null>(null);
+  const missingReposWarnedRef = useRef(false);
   const wsId = useWorkspaceId();
   const currentUser = useAuthStore((s) => s.user);
   const { data: issues = [], isFetched: issuesFetched } = useQuery(issueListOptions(wsId));
@@ -127,6 +129,11 @@ export function TasksTab({ agent }: { agent: Agent }) {
   useEffect(() => {
     void loadData();
   }, [agent.id]);
+
+  useEffect(() => {
+    workspaceReposReadyRef.current = null;
+    missingReposWarnedRef.current = false;
+  }, [wsId]);
 
   useEffect(() => {
     const activeTaskIDs = new Set(tasks.map((task) => task.id));
@@ -257,6 +264,36 @@ export function TasksTab({ agent }: { agent: Agent }) {
     );
   }, [tasks, externalSessions]);
 
+  const ensureWorkspaceReposReady = useCallback(async (): Promise<boolean> => {
+    if (workspaceReposReadyRef.current === true) return true;
+    if (workspaceReposReadyRef.current === false) {
+      if (!missingReposWarnedRef.current) {
+        toast.error("Workspace has no repositories. Attach at least one repo in Settings > Repositories first.");
+        missingReposWarnedRef.current = true;
+      }
+      return false;
+    }
+
+    try {
+      const workspace = await api.getWorkspace(wsId);
+      const repoCount = Array.isArray(workspace.repos) ? workspace.repos.length : 0;
+      if (repoCount > 0) {
+        workspaceReposReadyRef.current = true;
+        return true;
+      }
+
+      workspaceReposReadyRef.current = false;
+      if (!missingReposWarnedRef.current) {
+        toast.error("Workspace has no repositories. Attach at least one repo in Settings > Repositories first.");
+        missingReposWarnedRef.current = true;
+      }
+      return false;
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to verify workspace repositories");
+      return false;
+    }
+  }, [wsId]);
+
   useEffect(() => {
     if (!issuesFetched) return;
 
@@ -264,6 +301,9 @@ export function TasksTab({ agent }: { agent: Agent }) {
     let cancelled = false;
 
     const syncRunningResumeTasksToIssues = async () => {
+      const reposReady = await ensureWorkspaceReposReady();
+      if (!reposReady) return;
+
       const activeResumeTasks = tasks.filter((task) => {
         if (task.issue_id) return false;
         if (task.chat_session_id) return false;
@@ -377,6 +417,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
     resumeIssueHintsByWorkDir,
     issuesFetched,
     currentUser?.id,
+    ensureWorkspaceReposReady,
   ]);
 
   const copySessionId = async (sessionId: string) => {
@@ -396,6 +437,11 @@ export function TasksTab({ agent }: { agent: Agent }) {
     inFlightResumeSessionsRef.current.add(entry.session_id);
     setResumingSessionIds((prev) => ({ ...prev, [entry.session_id]: true }));
     try {
+      const reposReady = await ensureWorkspaceReposReady();
+      if (!reposReady) {
+        return;
+      }
+
       const selectedIssueId = issueBindingBySession[entry.session_id];
       const command = `codex resume ${entry.session_id}`;
       let effectiveIssueID = entry.issue_id || selectedIssueId;

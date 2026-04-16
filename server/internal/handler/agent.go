@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -686,6 +687,10 @@ func (h *Handler) ResumeAgentTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "agent has no runtime")
 		return
 	}
+	if err := h.ensureWorkspaceHasRepos(r.Context(), agent.WorkspaceID); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if h.DB == nil {
 		writeError(w, http.StatusInternalServerError, "database executor unavailable")
 		return
@@ -831,6 +836,10 @@ func (h *Handler) ResumeExternalSession(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "session_id is required")
 		return
 	}
+	if err := h.ensureWorkspaceHasRepos(r.Context(), agent.WorkspaceID); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 
 	issueID := pgtype.UUID{}
 	if req.IssueID != "" {
@@ -900,6 +909,20 @@ func (h *Handler) ResumeExternalSession(w http.ResponseWriter, r *http.Request) 
 	newTask.Context = ctxJSON
 
 	writeJSON(w, http.StatusCreated, taskToResponse(newTask))
+}
+
+func (h *Handler) ensureWorkspaceHasRepos(ctx context.Context, workspaceID pgtype.UUID) error {
+	workspace, err := h.Queries.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to load workspace repositories")
+	}
+
+	repos := parseWorkspaceRepos(workspace.Repos)
+	if len(repos) > 0 {
+		return nil
+	}
+
+	return fmt.Errorf("workspace has no repositories configured; attach at least one repository in Settings > Repositories before continuing")
 }
 
 func (h *Handler) BindAgentTaskIssue(w http.ResponseWriter, r *http.Request) {
