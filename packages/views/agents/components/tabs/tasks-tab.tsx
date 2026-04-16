@@ -6,6 +6,7 @@ import type { Agent, AgentExternalSession, AgentTask } from "@multica/core/types
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import { Button } from "@multica/ui/components/ui/button";
 import { api } from "@multica/core/api";
+import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { issueListOptions } from "@multica/core/issues/queries";
 import { useQuery } from "@tanstack/react-query";
@@ -45,6 +46,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
   const [resumingSessionId, setResumingSessionId] = useState<string | null>(null);
   const [issueBindingBySession, setIssueBindingBySession] = useState<Record<string, string>>({});
   const wsId = useWorkspaceId();
+  const currentUser = useAuthStore((s) => s.user);
   const { data: issues = [] } = useQuery(issueListOptions(wsId));
 
   const loadData = async () => {
@@ -89,11 +91,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
     () =>
       issues
         .filter(
-          (issue) =>
-            issue.assignee_type === "agent" &&
-            issue.assignee_id === agent.id &&
-            issue.status !== "done" &&
-            issue.status !== "cancelled",
+          (issue) => issue.status !== "done" && issue.status !== "cancelled",
         )
         .sort(
           (a, b) =>
@@ -165,26 +163,27 @@ export function TasksTab({ agent }: { agent: Agent }) {
         await api.resumeAgentTask(agent.id, entry.source_task_id);
       } else {
         const selectedIssueId = issueBindingBySession[entry.session_id];
-        const autoIssueId =
-          !entry.issue_id && !selectedIssueId && bindableIssues.length > 0
-            ? bindableIssues[0]!.id
-            : undefined;
-        const effectiveIssueID = entry.issue_id || selectedIssueId || autoIssueId;
+        const command = `codex resume ${entry.session_id}`;
+        let effectiveIssueID = entry.issue_id || selectedIssueId;
+
+        if (!effectiveIssueID) {
+          const createdIssue = await api.createIssue({
+            title: `Resume ${shortSessionId(entry.session_id)} · ${command}`,
+            description: `Auto-created for resume flow.\n\nCommand: ${command}\nWorkdir: ${entry.work_dir || "(unknown)"}`,
+            status: "todo",
+            priority: "none",
+            assignee_type: currentUser?.id ? "member" : undefined,
+            assignee_id: currentUser?.id || undefined,
+          });
+          effectiveIssueID = createdIssue.id;
+          toast.info(`Auto-created ${createdIssue.identifier} for this resume task.`);
+        }
 
         await api.resumeAgentExternalSession(agent.id, {
           session_id: entry.session_id,
           work_dir: entry.work_dir,
           issue_id: effectiveIssueID,
         });
-        if (autoIssueId && autoIssueId === effectiveIssueID) {
-          const autoIssue = issueMap.get(autoIssueId);
-          if (autoIssue) {
-            toast.info(`Auto-bound to ${autoIssue.identifier} for issue visibility.`);
-          }
-        }
-        if (!effectiveIssueID) {
-          toast.info("This run is not bound to an issue, it will show in Tasks only.");
-        }
       }
       toast.success("Resume task queued");
       await loadData();
