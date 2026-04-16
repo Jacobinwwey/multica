@@ -536,6 +536,9 @@ func (s *TaskService) resolveTaskWorkspaceID(ctx context.Context, task db.AgentT
 			}
 		}
 	}
+	if agent, err := s.Queries.GetAgent(ctx, task.AgentID); err == nil {
+		return util.UUIDToString(agent.WorkspaceID)
+	}
 	return ""
 }
 
