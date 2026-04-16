@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { ListTodo, RotateCcw, Copy } from "lucide-react";
 import type { Agent, AgentExternalSession, AgentTask } from "@multica/core/types";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
@@ -22,9 +22,36 @@ type ResumeEntry = {
   timestamp: string;
 };
 
+type ResumeIssueHint = {
+  id: string;
+  identifier: string;
+  title: string;
+};
+
 function shortSessionId(sessionId: string): string {
   if (sessionId.length <= 20) return sessionId;
   return `${sessionId.slice(0, 8)}...${sessionId.slice(-8)}`;
+}
+
+function extractResumeSessionFromIssue(issueTitle: string, issueDescription?: string | null): string {
+  const fullText = `${issueTitle}\n${issueDescription || ""}`;
+  const match = fullText.match(
+    /codex resume ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
+  );
+  return match?.[1]?.trim() || "";
+}
+
+function extractWorkDirFromIssueDescription(issueDescription?: string | null): string {
+  if (!issueDescription) return "";
+  const match = issueDescription.match(/^\s*Workdir:\s*(.+)\s*$/im);
+  return match?.[1]?.trim() || "";
+}
+
+function isPendingTaskConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const maybeError = error as { status?: number; message?: string };
+  if (maybeError.status === 409) return true;
+  return (maybeError.message || "").toLowerCase().includes("pending task");
 }
 
 function resolveTaskResumeCommand(task: AgentTask): string | null {
@@ -43,14 +70,18 @@ export function TasksTab({ agent }: { agent: Agent }) {
   const [tasks, setTasks] = useState<AgentTask[]>([]);
   const [externalSessions, setExternalSessions] = useState<AgentExternalSession[]>([]);
   const [loading, setLoading] = useState(true);
-  const [resumingSessionId, setResumingSessionId] = useState<string | null>(null);
+  const [resumingSessionIds, setResumingSessionIds] = useState<Record<string, boolean>>({});
   const [issueBindingBySession, setIssueBindingBySession] = useState<Record<string, string>>({});
+  const inFlightResumeSessionsRef = useRef<Set<string>>(new Set());
   const wsId = useWorkspaceId();
   const currentUser = useAuthStore((s) => s.user);
   const { data: issues = [] } = useQuery(issueListOptions(wsId));
 
-  const loadData = async () => {
-    setLoading(true);
+  const loadData = async (options?: { background?: boolean }) => {
+    const background = options?.background === true;
+    if (!background) {
+      setLoading(true);
+    }
     try {
       const [taskList, externalList] = await Promise.all([
         api.listAgentTasks(agent.id),
@@ -59,10 +90,14 @@ export function TasksTab({ agent }: { agent: Agent }) {
       setTasks(taskList);
       setExternalSessions(externalList);
     } catch {
-      setTasks([]);
-      setExternalSessions([]);
+      if (!background) {
+        setTasks([]);
+        setExternalSessions([]);
+      }
     } finally {
-      setLoading(false);
+      if (!background) {
+        setLoading(false);
+      }
     }
   };
 
@@ -97,8 +132,38 @@ export function TasksTab({ agent }: { agent: Agent }) {
           (a, b) =>
             Date.parse(b.updated_at || b.created_at) - Date.parse(a.updated_at || a.created_at),
         ),
-    [issues, agent.id],
+    [issues],
   );
+
+  const resumeIssueHintsBySession = useMemo(() => {
+    const bySession = new Map<string, ResumeIssueHint>();
+
+    for (const issue of bindableIssues) {
+      const sid = extractResumeSessionFromIssue(issue.title, issue.description);
+      if (!sid) continue;
+      bySession.set(sid, {
+        id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+      });
+    }
+    return bySession;
+  }, [bindableIssues]);
+
+  const resumeIssueHintsByWorkDir = useMemo(() => {
+    const byWorkDir = new Map<string, ResumeIssueHint>();
+
+    for (const issue of bindableIssues) {
+      const wd = extractWorkDirFromIssueDescription(issue.description);
+      if (!wd) continue;
+      byWorkDir.set(wd, {
+        id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+      });
+    }
+    return byWorkDir;
+  }, [bindableIssues]);
 
   const resumeEntries = useMemo(() => {
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -157,27 +222,99 @@ export function TasksTab({ agent }: { agent: Agent }) {
   };
 
   const handleResume = async (entry: ResumeEntry) => {
-    setResumingSessionId(entry.session_id);
+    if (inFlightResumeSessionsRef.current.has(entry.session_id)) {
+      toast.info("This session is already queueing.");
+      return;
+    }
+    inFlightResumeSessionsRef.current.add(entry.session_id);
+    setResumingSessionIds((prev) => ({ ...prev, [entry.session_id]: true }));
     try {
-      if (entry.source_task_id) {
-        await api.resumeAgentTask(agent.id, entry.source_task_id);
-      } else {
-        const selectedIssueId = issueBindingBySession[entry.session_id];
-        const command = `codex resume ${entry.session_id}`;
-        let effectiveIssueID = entry.issue_id || selectedIssueId;
+      const selectedIssueId = issueBindingBySession[entry.session_id];
+      const command = `codex resume ${entry.session_id}`;
+      let effectiveIssueID = entry.issue_id || selectedIssueId;
 
-        if (!effectiveIssueID) {
-          const createdIssue = await api.createIssue({
-            title: `Resume ${shortSessionId(entry.session_id)} · ${command}`,
-            description: `Auto-created for resume flow.\n\nCommand: ${command}\nWorkdir: ${entry.work_dir || "(unknown)"}`,
-            status: "todo",
-            priority: "none",
-            assignee_type: currentUser?.id ? "member" : undefined,
-            assignee_id: currentUser?.id || undefined,
-          });
-          effectiveIssueID = createdIssue.id;
-          toast.info(`Auto-created ${createdIssue.identifier} for this resume task.`);
+      if (entry.issue_id && !selectedIssueId) {
+        const existingIssue = issueMap.get(entry.issue_id);
+        const existingLabel = existingIssue
+          ? `${existingIssue.identifier} - ${existingIssue.title}`
+          : `Issue ${entry.issue_id.slice(0, 8)}...`;
+        const createNew = window.confirm(
+          `This session is already linked to ${existingLabel}.\n\nPress OK to create a NEW issue, or Cancel to reuse the existing issue.`,
+        );
+        if (createNew) {
+          effectiveIssueID = "";
+        } else {
+          toast.info(`Reusing ${existingLabel}`);
         }
+      }
+
+      if (!effectiveIssueID) {
+        const existingSessionIssue = resumeIssueHintsBySession.get(entry.session_id);
+        if (existingSessionIssue) {
+          const createNew = window.confirm(
+            `Session ${shortSessionId(entry.session_id)} is already linked to ${existingSessionIssue.identifier}.\n\nPress OK to create a NEW issue, or Cancel to reuse ${existingSessionIssue.identifier}.`,
+          );
+          if (!createNew) {
+            effectiveIssueID = existingSessionIssue.id;
+            toast.info(`Reusing ${existingSessionIssue.identifier}`);
+          }
+        }
+      }
+
+      if (!effectiveIssueID && entry.work_dir) {
+        const existingWorkDirIssue = resumeIssueHintsByWorkDir.get(entry.work_dir);
+        if (existingWorkDirIssue) {
+          const createNew = window.confirm(
+            `Found an existing resume issue for this workdir: ${existingWorkDirIssue.identifier}.\n\nPress OK to create a NEW issue, or Cancel to reuse ${existingWorkDirIssue.identifier}.`,
+          );
+          if (!createNew) {
+            effectiveIssueID = existingWorkDirIssue.id;
+            toast.info(`Reusing ${existingWorkDirIssue.identifier}`);
+          }
+        }
+      }
+
+      if (!effectiveIssueID) {
+        const createdIssue = await api.createIssue({
+          title: `Resume ${shortSessionId(entry.session_id)} · ${command}`,
+          description: `Auto-created for resume flow.\n\nCommand: ${command}\nWorkdir: ${entry.work_dir || "(unknown)"}`,
+          status: "todo",
+          priority: "none",
+          assignee_type: currentUser?.id ? "member" : undefined,
+          assignee_id: currentUser?.id || undefined,
+        });
+        effectiveIssueID = createdIssue.id;
+        toast.info(`Auto-created ${createdIssue.identifier} for this resume task.`);
+      }
+
+      try {
+        await api.resumeAgentExternalSession(agent.id, {
+          session_id: entry.session_id,
+          work_dir: entry.work_dir,
+          issue_id: effectiveIssueID,
+        });
+      } catch (resumeErr) {
+        if (!isPendingTaskConflict(resumeErr)) {
+          throw resumeErr;
+        }
+
+        const createNew = window.confirm(
+          `Issue already has a pending task for this agent.\n\nPress OK to create a NEW issue for another continue run, or Cancel to stop.`,
+        );
+        if (!createNew) {
+          throw resumeErr;
+        }
+
+        const createdIssue = await api.createIssue({
+          title: `Resume ${shortSessionId(entry.session_id)} · ${command}`,
+          description: `Auto-created for parallel resume run.\n\nCommand: ${command}\nWorkdir: ${entry.work_dir || "(unknown)"}`,
+          status: "todo",
+          priority: "none",
+          assignee_type: currentUser?.id ? "member" : undefined,
+          assignee_id: currentUser?.id || undefined,
+        });
+        effectiveIssueID = createdIssue.id;
+        toast.info(`Created ${createdIssue.identifier} due to pending-task conflict.`);
 
         await api.resumeAgentExternalSession(agent.id, {
           session_id: entry.session_id,
@@ -186,11 +323,16 @@ export function TasksTab({ agent }: { agent: Agent }) {
         });
       }
       toast.success("Resume task queued");
-      await loadData();
+      await loadData({ background: true });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Failed to queue resume task");
     } finally {
-      setResumingSessionId(null);
+      inFlightResumeSessionsRef.current.delete(entry.session_id);
+      setResumingSessionIds((prev) => {
+        const next = { ...prev };
+        delete next[entry.session_id];
+        return next;
+      });
     }
   };
 
@@ -247,7 +389,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
           <div className="space-y-1.5">
             {resumeEntries.map((entry) => {
               const issue = entry.issue_id ? issueMap.get(entry.issue_id) : undefined;
-              const isResuming = resumingSessionId === entry.session_id;
+              const isResuming = !!resumingSessionIds[entry.session_id];
               return (
                 <div
                   key={`resume-${entry.session_id}`}
@@ -281,6 +423,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
                         <select
                           className="h-7 min-w-[180px] rounded border bg-background px-2 text-xs"
                           value={issueBindingBySession[entry.session_id] ?? ""}
+                          disabled={isResuming}
                           onChange={(e) =>
                             setIssueBindingBySession((prev) => ({
                               ...prev,

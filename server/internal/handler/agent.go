@@ -770,12 +770,18 @@ func (h *Handler) ListAgentExternalSessions(w http.ResponseWriter, r *http.Reque
 	if err == nil {
 		latestBySession := map[string]db.AgentTaskQueue{}
 		for _, task := range taskRows {
-			if !task.SessionID.Valid || task.SessionID.String == "" {
-				continue
+			candidateSessionIDs := map[string]struct{}{}
+			if task.SessionID.Valid && task.SessionID.String != "" {
+				candidateSessionIDs[task.SessionID.String] = struct{}{}
 			}
-			sid := task.SessionID.String
-			if cur, exists := latestBySession[sid]; !exists || taskReferenceTime(task).After(taskReferenceTime(cur)) {
-				latestBySession[sid] = task
+			if resumeSID, _ := extractResumeMetadataFromTaskContext(task); resumeSID != "" {
+				candidateSessionIDs[resumeSID] = struct{}{}
+			}
+
+			for sid := range candidateSessionIDs {
+				if cur, exists := latestBySession[sid]; !exists || taskReferenceTime(task).After(taskReferenceTime(cur)) {
+					latestBySession[sid] = task
+				}
 			}
 		}
 
