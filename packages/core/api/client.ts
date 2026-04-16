@@ -500,6 +500,17 @@ export class ApiClient {
     });
   }
 
+  async bindAgentTaskIssue(
+    agentId: string,
+    taskId: string,
+    issueId: string,
+  ): Promise<AgentTask> {
+    return this.fetch(`/api/agents/${agentId}/tasks/${taskId}/bind-issue`, {
+      method: "POST",
+      body: JSON.stringify({ issue_id: issueId }),
+    });
+  }
+
   async getActiveTasksForIssue(issueId: string): Promise<{ tasks: AgentTask[] }> {
     return this.fetch(`/api/issues/${issueId}/active-task`);
   }

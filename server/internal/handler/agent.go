@@ -150,6 +150,10 @@ type ResumeExternalSessionRequest struct {
 	Priority  *int32 `json:"priority,omitempty"`
 }
 
+type BindTaskIssueRequest struct {
+	IssueID string `json:"issue_id"`
+}
+
 // TaskAgentData holds agent info included in claim responses so the daemon
 // can set up the execution environment (branch naming, skill files, instructions).
 type TaskAgentData struct {
@@ -896,6 +900,120 @@ func (h *Handler) ResumeExternalSession(w http.ResponseWriter, r *http.Request) 
 	newTask.Context = ctxJSON
 
 	writeJSON(w, http.StatusCreated, taskToResponse(newTask))
+}
+
+func (h *Handler) BindAgentTaskIssue(w http.ResponseWriter, r *http.Request) {
+	agentID := chi.URLParam(r, "id")
+	taskID := chi.URLParam(r, "taskId")
+
+	agent, ok := h.loadAgentForUser(w, r, agentID)
+	if !ok {
+		return
+	}
+	if h.DB == nil {
+		writeError(w, http.StatusInternalServerError, "database executor unavailable")
+		return
+	}
+
+	var req BindTaskIssueRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.IssueID = strings.TrimSpace(req.IssueID)
+	if req.IssueID == "" {
+		writeError(w, http.StatusBadRequest, "issue_id is required")
+		return
+	}
+
+	issueID := parseUUID(req.IssueID)
+	if !issueID.Valid {
+		writeError(w, http.StatusBadRequest, "invalid issue_id")
+		return
+	}
+	if _, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+		ID:          issueID,
+		WorkspaceID: agent.WorkspaceID,
+	}); err != nil {
+		writeError(w, http.StatusBadRequest, "issue_id does not belong to this workspace")
+		return
+	}
+
+	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if uuidToString(task.AgentID) != agentID {
+		writeError(w, http.StatusForbidden, "task does not belong to this agent")
+		return
+	}
+	if task.ChatSessionID.Valid {
+		writeError(w, http.StatusBadRequest, "chat tasks cannot be bound to issues")
+		return
+	}
+	if task.IssueID.Valid {
+		if uuidToString(task.IssueID) == req.IssueID {
+			writeJSON(w, http.StatusOK, taskToResponse(task))
+			return
+		}
+		writeError(w, http.StatusConflict, "task is already bound to a different issue")
+		return
+	}
+	if task.Status != "queued" && task.Status != "dispatched" && task.Status != "running" {
+		writeError(w, http.StatusBadRequest, "only queued/dispatched/running tasks can be bound")
+		return
+	}
+
+	cmdTag, err := h.DB.Exec(
+		r.Context(),
+		`UPDATE agent_task_queue
+		 SET issue_id = $2
+		 WHERE id = $1
+		   AND issue_id IS NULL
+		   AND status IN ('queued', 'dispatched', 'running')`,
+		task.ID,
+		issueID,
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "issue already has a pending task for this agent")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to bind task issue")
+		return
+	}
+	if cmdTag.RowsAffected() == 0 {
+		writeError(w, http.StatusConflict, "task cannot be bound in current state")
+		return
+	}
+
+	updatedTask, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load updated task")
+		return
+	}
+
+	// Re-broadcast a dispatch-style event so issue pages can pick up an already
+	// running task immediately after it gets bound to an issue.
+	dispatchPayload := map[string]any{}
+	if len(updatedTask.Context) > 0 {
+		_ = json.Unmarshal(updatedTask.Context, &dispatchPayload)
+	}
+	if dispatchPayload == nil {
+		dispatchPayload = map[string]any{}
+	}
+	dispatchPayload["task_id"] = uuidToString(updatedTask.ID)
+	dispatchPayload["runtime_id"] = uuidToString(updatedTask.RuntimeID)
+	dispatchPayload["issue_id"] = uuidToString(updatedTask.IssueID)
+	dispatchPayload["agent_id"] = uuidToString(updatedTask.AgentID)
+
+	wsID := uuidToString(agent.WorkspaceID)
+	userID := requestUserID(r)
+	actorType, actorID := h.resolveActor(r, userID, wsID)
+	h.publish(protocol.EventTaskDispatch, wsID, actorType, actorID, dispatchPayload)
+
+	writeJSON(w, http.StatusOK, taskToResponse(updatedTask))
 }
 
 func parseLookbackDays(raw string) int {

@@ -54,6 +54,14 @@ function isPendingTaskConflict(error: unknown): boolean {
   return (maybeError.message || "").toLowerCase().includes("pending task");
 }
 
+function isAlreadyBoundTaskConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const maybeError = error as { status?: number; message?: string };
+  if (maybeError.status !== 409) return false;
+  const message = (maybeError.message || "").toLowerCase();
+  return message.includes("already bound") || message.includes("cannot be bound");
+}
+
 function resolveTaskResumeCommand(task: AgentTask): string | null {
   const explicitCommand = (task.resume_command || "").trim();
   if (explicitCommand) return explicitCommand;
@@ -66,6 +74,19 @@ function resolveTaskResumeCommand(task: AgentTask): string | null {
   return resumeSessionID ? `codex resume ${resumeSessionID}` : null;
 }
 
+function resolveTaskResumeSessionId(task: AgentTask): string {
+  return (
+    task.resume_session_id ||
+    task.prior_session_id ||
+    task.session_id ||
+    ""
+  ).trim();
+}
+
+function isActiveTaskStatus(status: AgentTask["status"]): boolean {
+  return status === "running" || status === "dispatched" || status === "queued";
+}
+
 export function TasksTab({ agent }: { agent: Agent }) {
   const [tasks, setTasks] = useState<AgentTask[]>([]);
   const [externalSessions, setExternalSessions] = useState<AgentExternalSession[]>([]);
@@ -73,9 +94,11 @@ export function TasksTab({ agent }: { agent: Agent }) {
   const [resumingSessionIds, setResumingSessionIds] = useState<Record<string, boolean>>({});
   const [issueBindingBySession, setIssueBindingBySession] = useState<Record<string, string>>({});
   const inFlightResumeSessionsRef = useRef<Set<string>>(new Set());
+  const inFlightTaskIssueBindingsRef = useRef<Set<string>>(new Set());
+  const attemptedTaskIssueBindingsRef = useRef<Set<string>>(new Set());
   const wsId = useWorkspaceId();
   const currentUser = useAuthStore((s) => s.user);
-  const { data: issues = [] } = useQuery(issueListOptions(wsId));
+  const { data: issues = [], isFetched: issuesFetched } = useQuery(issueListOptions(wsId));
 
   const loadData = async (options?: { background?: boolean }) => {
     const background = options?.background === true;
@@ -105,19 +128,32 @@ export function TasksTab({ agent }: { agent: Agent }) {
     void loadData();
   }, [agent.id]);
 
-  const activeStatuses = ["running", "dispatched", "queued"];
+  useEffect(() => {
+    const activeTaskIDs = new Set(tasks.map((task) => task.id));
+    attemptedTaskIssueBindingsRef.current.forEach((taskID) => {
+      if (!activeTaskIDs.has(taskID)) {
+        attemptedTaskIssueBindingsRef.current.delete(taskID);
+      }
+    });
+  }, [tasks]);
+
   const sortedTasks = useMemo(
-    () =>
-      [...tasks].sort((a, b) => {
-        const aActive = activeStatuses.indexOf(a.status);
-        const bActive = activeStatuses.indexOf(b.status);
-        const aIsActive = aActive !== -1;
-        const bIsActive = bActive !== -1;
-        if (aIsActive && !bIsActive) return -1;
-        if (!aIsActive && bIsActive) return 1;
-        if (aIsActive && bIsActive) return aActive - bActive;
+    () => {
+      const statusRank: Record<AgentTask["status"], number> = {
+        running: 0,
+        dispatched: 1,
+        queued: 2,
+        completed: 3,
+        failed: 3,
+        cancelled: 3,
+      };
+      return [...tasks].sort((a, b) => {
+        const aRank = statusRank[a.status];
+        const bRank = statusRank[b.status];
+        if (aRank !== bRank) return aRank - bRank;
         return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-      }),
+      });
+    },
     [tasks],
   );
 
@@ -165,6 +201,15 @@ export function TasksTab({ agent }: { agent: Agent }) {
     return byWorkDir;
   }, [bindableIssues]);
 
+  const externalSessionById = useMemo(() => {
+    const bySession = new Map<string, AgentExternalSession>();
+    for (const external of externalSessions) {
+      if (!external.session_id) continue;
+      bySession.set(external.session_id, external);
+    }
+    return bySession;
+  }, [externalSessions]);
+
   const resumeEntries = useMemo(() => {
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     const bySession = new Map<string, ResumeEntry>();
@@ -211,6 +256,128 @@ export function TasksTab({ agent }: { agent: Agent }) {
       (a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp),
     );
   }, [tasks, externalSessions]);
+
+  useEffect(() => {
+    if (!issuesFetched) return;
+
+    const sessionIssueCache = new Map<string, string>();
+    let cancelled = false;
+
+    const syncRunningResumeTasksToIssues = async () => {
+      const activeResumeTasks = tasks.filter((task) => {
+        if (task.issue_id) return false;
+        if (task.chat_session_id) return false;
+        if (!isActiveTaskStatus(task.status)) return false;
+        return resolveTaskResumeSessionId(task) !== "";
+      });
+      if (activeResumeTasks.length === 0) return;
+
+      let boundCount = 0;
+      let createdIssueCount = 0;
+
+      for (const task of activeResumeTasks) {
+        if (cancelled) return;
+        if (attemptedTaskIssueBindingsRef.current.has(task.id)) continue;
+        if (inFlightTaskIssueBindingsRef.current.has(task.id)) continue;
+
+        const resumeSessionID = resolveTaskResumeSessionId(task);
+        if (!resumeSessionID) continue;
+
+        attemptedTaskIssueBindingsRef.current.add(task.id);
+        inFlightTaskIssueBindingsRef.current.add(task.id);
+
+        try {
+          const external = externalSessionById.get(resumeSessionID);
+          const effectiveWorkDir = (task.work_dir || external?.work_dir || "").trim();
+
+          let targetIssueID = (
+            sessionIssueCache.get(resumeSessionID) ||
+            external?.issue_id ||
+            resumeIssueHintsBySession.get(resumeSessionID)?.id ||
+            ""
+          ).trim();
+
+          if (!targetIssueID && effectiveWorkDir) {
+            targetIssueID = (resumeIssueHintsByWorkDir.get(effectiveWorkDir)?.id || "").trim();
+          }
+
+          if (!targetIssueID) {
+            const command = `codex resume ${resumeSessionID}`;
+            const createdIssue = await api.createIssue({
+              title: `Resume ${shortSessionId(resumeSessionID)} - ${command}`,
+              description:
+                `Auto-created for running resume task issue sync.\n\n` +
+                `Command: ${command}\n` +
+                `Workdir: ${effectiveWorkDir || "(unknown)"}`,
+              status: "todo",
+              priority: "none",
+              assignee_type: currentUser?.id ? "member" : undefined,
+              assignee_id: currentUser?.id || undefined,
+            });
+            targetIssueID = createdIssue.id;
+            sessionIssueCache.set(resumeSessionID, targetIssueID);
+            createdIssueCount += 1;
+          }
+
+          try {
+            await api.bindAgentTaskIssue(agent.id, task.id, targetIssueID);
+            boundCount += 1;
+          } catch (bindErr) {
+            if (isAlreadyBoundTaskConflict(bindErr)) {
+              boundCount += 1;
+              continue;
+            }
+            if (!isPendingTaskConflict(bindErr)) {
+              throw bindErr;
+            }
+
+            const command = `codex resume ${resumeSessionID}`;
+            const fallbackIssue = await api.createIssue({
+              title: `Resume ${shortSessionId(resumeSessionID)} - ${command}`,
+              description:
+                `Auto-created after issue-binding conflict.\n\n` +
+                `Command: ${command}\n` +
+                `Workdir: ${effectiveWorkDir || "(unknown)"}`,
+              status: "todo",
+              priority: "none",
+              assignee_type: currentUser?.id ? "member" : undefined,
+              assignee_id: currentUser?.id || undefined,
+            });
+            await api.bindAgentTaskIssue(agent.id, task.id, fallbackIssue.id);
+            sessionIssueCache.set(resumeSessionID, fallbackIssue.id);
+            createdIssueCount += 1;
+            boundCount += 1;
+          }
+        } catch (syncErr) {
+          console.error("failed to auto-sync running task to issue", syncErr);
+        } finally {
+          inFlightTaskIssueBindingsRef.current.delete(task.id);
+        }
+      }
+
+      if (cancelled) return;
+      if (boundCount === 0) return;
+
+      if (createdIssueCount > 0) {
+        toast.info(`Auto-created ${createdIssueCount} issue(s) and synced running Codex task(s).`);
+      }
+      await loadData({ background: true });
+    };
+
+    void syncRunningResumeTasksToIssues();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    agent.id,
+    tasks,
+    externalSessionById,
+    resumeIssueHintsBySession,
+    resumeIssueHintsByWorkDir,
+    issuesFetched,
+    currentUser?.id,
+  ]);
 
   const copySessionId = async (sessionId: string) => {
     try {
@@ -276,7 +443,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
 
       if (!effectiveIssueID) {
         const createdIssue = await api.createIssue({
-          title: `Resume ${shortSessionId(entry.session_id)} · ${command}`,
+          title: `Resume ${shortSessionId(entry.session_id)} - ${command}`,
           description: `Auto-created for resume flow.\n\nCommand: ${command}\nWorkdir: ${entry.work_dir || "(unknown)"}`,
           status: "todo",
           priority: "none",
@@ -306,7 +473,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
         }
 
         const createdIssue = await api.createIssue({
-          title: `Resume ${shortSessionId(entry.session_id)} · ${command}`,
+          title: `Resume ${shortSessionId(entry.session_id)} - ${command}`,
           description: `Auto-created for parallel resume run.\n\nCommand: ${command}\nWorkdir: ${entry.work_dir || "(unknown)"}`,
           status: "todo",
           priority: "none",
