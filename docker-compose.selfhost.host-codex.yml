@@ -1,0 +1,22 @@
+# Optional override for Linux self-host users who need the backend container
+# to discover Codex processes running on the host machine.
+#
+# Usage:
+#   docker compose \
+#     -f docker-compose.selfhost.yml \
+#     -f docker-compose.selfhost.host-codex.yml \
+#     up -d --build
+#
+# Security note:
+# - Mounts host /proc read-only into backend
+# - Adds SYS_PTRACE capability for better /proc visibility
+
+services:
+  backend:
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - ${MULTICA_HOST_PROC_ROOT:-/proc}:/host-proc:ro
+    environment:
+      MULTICA_CODEX_PROC_ROOT: ${MULTICA_CODEX_PROC_ROOT:-/host-proc}
+      MULTICA_CODEX_HOST_ELEVATED: ${MULTICA_CODEX_HOST_ELEVATED:-true}
