@@ -8,11 +8,14 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -142,13 +145,38 @@ type ExternalSessionResponse struct {
 	LastSeenAt   string `json:"last_seen_at"`
 	IssueID      string `json:"issue_id,omitempty"`
 	SourceTaskID string `json:"source_task_id,omitempty"`
+	Source       string `json:"source,omitempty"`     // session_file/process/merged
+	IsRunning    bool   `json:"is_running,omitempty"` // true when discovered from live process table
+	LeaderPID    int    `json:"leader_pid,omitempty"` // process id that currently owns this resume session
+	Command      string `json:"command,omitempty"`    // full command line from process table
+	TTY          string `json:"tty,omitempty"`        // tty from process table, when available
+}
+
+type HostCodexElevationResponse struct {
+	Enabled             bool   `json:"enabled"`
+	Mode                string `json:"mode"` // standard/elevated
+	CanAutoEnable       bool   `json:"can_auto_enable"`
+	AutoEnableAttempted bool   `json:"auto_enable_attempted,omitempty"`
+	AutoEnableApplied   bool   `json:"auto_enable_applied,omitempty"`
+	RequiresRestart     bool   `json:"requires_restart,omitempty"`
+	ProcRoot            string `json:"proc_root,omitempty"`
+	SessionRoot         string `json:"session_root,omitempty"`
+	EnableCommand       string `json:"enable_command,omitempty"`
+	DisableCommand      string `json:"disable_command,omitempty"`
+	LastAction          string `json:"last_action,omitempty"`    // enable/disable
+	LastCommand         string `json:"last_command,omitempty"`   // command executed in last action
+	LastOutput          string `json:"last_output,omitempty"`    // combined stdout/stderr
+	LastError           string `json:"last_error,omitempty"`     // action error (if failed)
+	LastActionAt        string `json:"last_action_at,omitempty"` // RFC3339 UTC
+	Message             string `json:"message,omitempty"`
 }
 
 type ResumeExternalSessionRequest struct {
-	SessionID string `json:"session_id"`
-	WorkDir   string `json:"work_dir"`
-	IssueID   string `json:"issue_id"`
-	Priority  *int32 `json:"priority,omitempty"`
+	SessionID       string `json:"session_id"`
+	WorkDir         string `json:"work_dir"`
+	IssueID         string `json:"issue_id"`
+	Priority        *int32 `json:"priority,omitempty"`
+	AllowRootResume bool   `json:"allow_root_resume,omitempty"`
 }
 
 type BindTaskIssueRequest struct {
@@ -181,13 +209,38 @@ type codexSessionRecord struct {
 	LastSeenAt time.Time
 }
 
+type codexResumeProcess struct {
+	SessionID string
+	PID       int
+	PPID      int
+	TTY       string
+	Command   string
+}
+
+type hostCodexActionLog struct {
+	Action    string
+	Command   string
+	Output    string
+	Error     string
+	UpdatedAt time.Time
+}
+
 const (
 	defaultExternalSessionLookbackDays = 7
 	maxExternalSessionLookbackDays     = 30
 	defaultManualResumePriority        = 50
+	resumeErrorCodeIssueRequired       = "issue_id_required"
+	resumeErrorCodeRootPermission      = "root_permission_required"
+	hostCodexToggleTimeout             = 2 * time.Minute
 )
 
 var rolloutSessionIDPattern = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+var codexResumeCommandSessionPattern = regexp.MustCompile(`(?i)\bresume\b\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`)
+
+var (
+	hostCodexActionMu   sync.RWMutex
+	lastHostCodexAction hostCodexActionLog
+)
 
 func taskToResponse(t db.AgentTaskQueue) AgentTaskResponse {
 	var result any
@@ -761,19 +814,25 @@ func (h *Handler) ListAgentExternalSessions(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	days := parseLookbackDays(r.URL.Query().Get("days"))
 	root := resolveCodexSessionRoot()
-	if root == "" {
-		writeJSON(w, http.StatusOK, []ExternalSessionResponse{})
-		return
+
+	fileSessions := []ExternalSessionResponse{}
+	if root != "" {
+		scanned, err := scanCodexSessions(root, days)
+		if err != nil {
+			slog.Warn("scan codex session files failed", append(logger.RequestAttrs(r), "error", err, "root", root)...)
+		} else {
+			fileSessions = scanned
+		}
 	}
 
-	days := parseLookbackDays(r.URL.Query().Get("days"))
-	external, err := scanCodexSessions(root, days)
+	liveSessions, err := scanRunningCodexSessions()
 	if err != nil {
-		slog.Warn("scan codex sessions failed", append(logger.RequestAttrs(r), "error", err, "root", root)...)
-		writeJSON(w, http.StatusOK, []ExternalSessionResponse{})
-		return
+		slog.Warn("scan running codex sessions failed", append(logger.RequestAttrs(r), "error", err)...)
 	}
+
+	external := mergeExternalSessions(fileSessions, liveSessions)
 
 	taskRows, err := h.Queries.ListAgentTasks(r.Context(), parseUUID(agentID))
 	if err == nil {
@@ -805,7 +864,120 @@ func (h *Handler) ListAgentExternalSessions(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	sortExternalSessions(external)
+
 	writeJSON(w, http.StatusOK, external)
+}
+
+func (h *Handler) GetHostCodexElevation(w http.ResponseWriter, r *http.Request) {
+	agentID := chi.URLParam(r, "id")
+	agent, ok := h.loadAgentForUser(w, r, agentID)
+	if !ok {
+		return
+	}
+
+	if _, ok := h.requireWorkspaceRole(
+		w,
+		r,
+		uuidToString(agent.WorkspaceID),
+		"agent not found",
+		"owner",
+		"admin",
+	); !ok {
+		return
+	}
+
+	writeJSON(w, http.StatusOK, buildHostCodexElevationStatus(""))
+}
+
+func (h *Handler) EnableHostCodexElevation(w http.ResponseWriter, r *http.Request) {
+	agentID := chi.URLParam(r, "id")
+	agent, ok := h.loadAgentForUser(w, r, agentID)
+	if !ok {
+		return
+	}
+
+	if _, ok := h.requireWorkspaceRole(
+		w,
+		r,
+		uuidToString(agent.WorkspaceID),
+		"agent not found",
+		"owner",
+		"admin",
+	); !ok {
+		return
+	}
+
+	status := buildHostCodexElevationStatus("")
+	status.AutoEnableAttempted = true
+	if status.Enabled {
+		status.AutoEnableApplied = true
+		writeJSON(w, http.StatusOK, status)
+		return
+	}
+	if !status.CanAutoEnable {
+		status.AutoEnableApplied = false
+		if status.Message == "" {
+			status.Message = "Automatic enable is not available in this deployment. Run the provided command on the self-host machine."
+		}
+		writeJSON(w, http.StatusOK, status)
+		return
+	}
+
+	if _, err := runHostCodexAutoEnable(); err != nil {
+		writeJSON(w, http.StatusOK, buildHostCodexElevationStatus(
+			fmt.Sprintf("Automatic enable failed: %s", err.Error()),
+		))
+		return
+	}
+
+	updated := buildHostCodexElevationStatus("Elevated host-codex mode command was executed. If sessions are still missing, wait a few seconds and refresh.")
+	updated.AutoEnableAttempted = true
+	updated.AutoEnableApplied = updated.Enabled
+	if !updated.Enabled {
+		updated.RequiresRestart = true
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (h *Handler) DisableHostCodexElevation(w http.ResponseWriter, r *http.Request) {
+	agentID := chi.URLParam(r, "id")
+	agent, ok := h.loadAgentForUser(w, r, agentID)
+	if !ok {
+		return
+	}
+
+	if _, ok := h.requireWorkspaceRole(
+		w,
+		r,
+		uuidToString(agent.WorkspaceID),
+		"agent not found",
+		"owner",
+		"admin",
+	); !ok {
+		return
+	}
+
+	status := buildHostCodexElevationStatus("")
+	if !status.CanAutoEnable {
+		status.AutoEnableApplied = false
+		if status.Message == "" {
+			status.Message = "Automatic disable is not available in this deployment. Run the provided disable command on the self-host machine."
+		}
+		writeJSON(w, http.StatusOK, status)
+		return
+	}
+
+	if _, err := runHostCodexAutoDisable(); err != nil {
+		writeJSON(w, http.StatusOK, buildHostCodexElevationStatus(
+			fmt.Sprintf("Automatic disable failed: %s", err.Error()),
+		))
+		return
+	}
+
+	updated := buildHostCodexElevationStatus("Disable command was executed. If mode still appears elevated, wait a few seconds and refresh.")
+	updated.RequiresRestart = false
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func (h *Handler) ResumeExternalSession(w http.ResponseWriter, r *http.Request) {
@@ -836,38 +1008,53 @@ func (h *Handler) ResumeExternalSession(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "session_id is required")
 		return
 	}
+	if req.IssueID == "" {
+		writeErrorWithCode(
+			w,
+			http.StatusBadRequest,
+			resumeErrorCodeIssueRequired,
+			"issue_id is required when continuing a Codex session; create or reuse an issue first",
+		)
+		return
+	}
+	if isRootScopedWorkDir(req.WorkDir) && !req.AllowRootResume {
+		writeErrorWithCode(
+			w,
+			http.StatusForbidden,
+			resumeErrorCodeRootPermission,
+			"this session uses a /root work directory; explicit root permission acknowledgement is required before continuing",
+		)
+		return
+	}
 	if err := h.ensureWorkspaceHasRepos(r.Context(), agent.WorkspaceID); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 
-	issueID := pgtype.UUID{}
-	if req.IssueID != "" {
-		issueID = parseUUID(req.IssueID)
-		if !issueID.Valid {
-			writeError(w, http.StatusBadRequest, "invalid issue_id")
-			return
-		}
-		if _, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
-			ID:          issueID,
-			WorkspaceID: agent.WorkspaceID,
-		}); err != nil {
-			writeError(w, http.StatusBadRequest, "issue_id does not belong to this workspace")
-			return
-		}
+	issueID := parseUUID(req.IssueID)
+	if !issueID.Valid {
+		writeError(w, http.StatusBadRequest, "invalid issue_id")
+		return
+	}
+	if _, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+		ID:          issueID,
+		WorkspaceID: agent.WorkspaceID,
+	}); err != nil {
+		writeError(w, http.StatusBadRequest, "issue_id does not belong to this workspace")
+		return
+	}
 
-		hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(r.Context(), db.HasPendingTaskForIssueAndAgentParams{
-			IssueID: issueID,
-			AgentID: parseUUID(agentID),
-		})
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to check pending tasks")
-			return
-		}
-		if hasPending {
-			writeError(w, http.StatusConflict, "there is already a pending task for this issue")
-			return
-		}
+	hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(r.Context(), db.HasPendingTaskForIssueAndAgentParams{
+		IssueID: issueID,
+		AgentID: parseUUID(agentID),
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check pending tasks")
+		return
+	}
+	if hasPending {
+		writeError(w, http.StatusConflict, "there is already a pending task for this issue")
+		return
 	}
 
 	priority := int32(defaultManualResumePriority)
@@ -893,8 +1080,8 @@ func (h *Handler) ResumeExternalSession(w http.ResponseWriter, r *http.Request) 
 	if req.WorkDir != "" {
 		resumeContext["resume_work_dir"] = req.WorkDir
 	}
-	if !issueID.Valid {
-		resumeContext["resume_manual"] = true
+	if req.AllowRootResume && isRootScopedWorkDir(req.WorkDir) {
+		resumeContext["root_permission_ack"] = true
 	}
 
 	ctxJSON, err := json.Marshal(resumeContext)
@@ -1054,6 +1241,15 @@ func parseLookbackDays(raw string) int {
 	return n
 }
 
+func isRootScopedWorkDir(workDir string) bool {
+	clean := strings.TrimSpace(workDir)
+	if clean == "" {
+		return false
+	}
+	clean = strings.ReplaceAll(clean, "\\", "/")
+	return clean == "/root" || strings.HasPrefix(clean, "/root/")
+}
+
 func resolveCodexSessionRoot() string {
 	candidates := []string{
 		strings.TrimSpace(os.Getenv("MULTICA_CODEX_SESSIONS_ROOT")),
@@ -1076,6 +1272,232 @@ func resolveCodexSessionRoot() string {
 		}
 	}
 	return ""
+}
+
+func resolveCodexProcRoot() string {
+	candidates := []string{
+		strings.TrimSpace(os.Getenv("MULTICA_CODEX_PROC_ROOT")),
+		"/proc",
+	}
+
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		info, err := os.Stat(candidate)
+		if err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func buildHostCodexElevationStatus(message string) HostCodexElevationResponse {
+	procRoot := resolveCodexProcRoot()
+	sessionRoot := resolveCodexSessionRoot()
+	enableCmd := hostCodexEnableCommand()
+	disableCmd := hostCodexDisableCommand()
+	canAuto := canAutoEnableHostCodex()
+
+	enabled := isHostCodexElevated(procRoot)
+	mode := "standard"
+	if enabled {
+		mode = "elevated"
+	}
+
+	if message == "" {
+		if enabled {
+			message = "Elevated host-codex mode is enabled."
+		} else if canAuto {
+			message = "Click Enable to run elevated host-codex activation automatically."
+		} else {
+			message = "Automatic enable is unavailable in this deployment. Use the command below on the self-host machine."
+		}
+	}
+
+	last := getLastHostCodexAction()
+	lastActionAt := ""
+	if !last.UpdatedAt.IsZero() {
+		lastActionAt = last.UpdatedAt.UTC().Format(time.RFC3339)
+	}
+
+	return HostCodexElevationResponse{
+		Enabled:        enabled,
+		Mode:           mode,
+		CanAutoEnable:  canAuto,
+		ProcRoot:       procRoot,
+		SessionRoot:    sessionRoot,
+		EnableCommand:  enableCmd,
+		DisableCommand: disableCmd,
+		LastAction:     last.Action,
+		LastCommand:    last.Command,
+		LastOutput:     last.Output,
+		LastError:      last.Error,
+		LastActionAt:   lastActionAt,
+		Message:        message,
+	}
+}
+
+func isHostCodexElevated(procRoot string) bool {
+	if isTruthyEnv("MULTICA_CODEX_HOST_ELEVATED") {
+		return true
+	}
+
+	normalized := strings.ReplaceAll(strings.TrimSpace(procRoot), "\\", "/")
+	if normalized == "" {
+		return false
+	}
+
+	// Host-codex override mounts host /proc to /host-proc and points
+	// MULTICA_CODEX_PROC_ROOT there.
+	return strings.HasPrefix(normalized, "/host-proc")
+}
+
+func canAutoEnableHostCodex() bool {
+	if !isTruthyEnv("MULTICA_ALLOW_PRIVILEGED_TOGGLE") {
+		return false
+	}
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		return false
+	}
+	_, ok := resolveSelfhostComposeDir()
+	return ok
+}
+
+func runHostCodexAutoEnable() (string, error) {
+	return runHostCodexComposeCommand(
+		"enable",
+		true,
+		"up", "-d", "--build", "backend",
+	)
+}
+
+func runHostCodexAutoDisable() (string, error) {
+	return runHostCodexComposeCommand(
+		"disable",
+		false,
+		"up", "-d", "--build", "backend",
+	)
+}
+
+func runHostCodexComposeCommand(action string, useHostOverride bool, composeArgs ...string) (string, error) {
+	composeDir, ok := resolveSelfhostComposeDir()
+	if !ok {
+		err := fmt.Errorf("self-host compose directory not found")
+		recordHostCodexAction(action, "", "", err)
+		return "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), hostCodexToggleTimeout)
+	defer cancel()
+
+	cmdArgs := []string{
+		"compose",
+		"-f", "docker-compose.selfhost.yml",
+	}
+	if useHostOverride {
+		cmdArgs = append(cmdArgs, "-f", "docker-compose.selfhost.host-codex.yml")
+	}
+	cmdArgs = append(cmdArgs, composeArgs...)
+
+	cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
+	cmd.Dir = composeDir
+
+	out, err := cmd.CombinedOutput()
+	outputText := strings.TrimSpace(string(out))
+	commandText := "docker " + strings.Join(cmdArgs, " ")
+	recordHostCodexAction(action, commandText, outputText, err)
+
+	if err != nil {
+		if outputText == "" {
+			return outputText, err
+		}
+		return outputText, fmt.Errorf("%w: %s", err, outputText)
+	}
+
+	return outputText, nil
+}
+
+func recordHostCodexAction(action, command, output string, actionErr error) {
+	hostCodexActionMu.Lock()
+	defer hostCodexActionMu.Unlock()
+
+	entry := hostCodexActionLog{
+		Action:    strings.TrimSpace(action),
+		Command:   strings.TrimSpace(command),
+		Output:    strings.TrimSpace(output),
+		UpdatedAt: time.Now().UTC(),
+	}
+	if actionErr != nil {
+		entry.Error = strings.TrimSpace(actionErr.Error())
+	}
+	lastHostCodexAction = entry
+}
+
+func getLastHostCodexAction() hostCodexActionLog {
+	hostCodexActionMu.RLock()
+	defer hostCodexActionMu.RUnlock()
+	return lastHostCodexAction
+}
+
+func resolveSelfhostComposeDir() (string, bool) {
+	candidates := []string{
+		strings.TrimSpace(os.Getenv("MULTICA_SELFHOST_DIR")),
+		".",
+		"..",
+		"/opt/multica",
+		"/srv/multica",
+	}
+
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+
+		base := candidate
+		if !filepath.IsAbs(base) {
+			abs, err := filepath.Abs(base)
+			if err == nil {
+				base = abs
+			}
+		}
+
+		if !fileExists(filepath.Join(base, "docker-compose.selfhost.yml")) {
+			continue
+		}
+		if !fileExists(filepath.Join(base, "docker-compose.selfhost.host-codex.yml")) {
+			continue
+		}
+		return base, true
+	}
+
+	return "", false
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func hostCodexEnableCommand() string {
+	return "docker compose -f docker-compose.selfhost.yml -f docker-compose.selfhost.host-codex.yml up -d --build backend"
+}
+
+func hostCodexDisableCommand() string {
+	return "docker compose -f docker-compose.selfhost.yml up -d --build backend"
+}
+
+func isTruthyEnv(name string) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func scanCodexSessions(root string, days int) ([]ExternalSessionResponse, error) {
@@ -1115,12 +1537,341 @@ func scanCodexSessions(root string, days int) ([]ExternalSessionResponse, error)
 			SessionID:  record.SessionID,
 			WorkDir:    record.WorkDir,
 			LastSeenAt: record.LastSeenAt.UTC().Format(time.RFC3339),
+			Source:     "session_file",
 		})
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].LastSeenAt > result[j].LastSeenAt
-	})
+	sortExternalSessions(result)
 	return result, nil
+}
+
+func scanRunningCodexSessions() ([]ExternalSessionResponse, error) {
+	if runtime.GOOS != "linux" {
+		return []ExternalSessionResponse{}, nil
+	}
+
+	procRoot := resolveCodexProcRoot()
+	if procRoot != "" {
+		sessions, err := scanRunningCodexSessionsFromProc(procRoot)
+		if err == nil {
+			return sessions, nil
+		}
+		// Fallback to ps when proc-root scan fails, to keep behavior resilient.
+		slog.Warn("scan codex sessions from proc root failed; fallback to ps", "proc_root", procRoot, "error", err)
+	}
+
+	return scanRunningCodexSessionsFromPS()
+}
+
+func scanRunningCodexSessionsFromPS() ([]ExternalSessionResponse, error) {
+	cmd := exec.Command("ps", "-eo", "pid=,ppid=,tty=,args=")
+	raw, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	processes := parseCodexResumeProcesses(string(raw))
+	if len(processes) == 0 {
+		return []ExternalSessionResponse{}, nil
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	bySessionID := map[string]ExternalSessionResponse{}
+
+	for _, proc := range processes {
+		workDir := readProcessCwd("/proc", proc.PID)
+		candidate := ExternalSessionResponse{
+			SessionID:  proc.SessionID,
+			WorkDir:    workDir,
+			LastSeenAt: now,
+			Source:     "process",
+			IsRunning:  true,
+			LeaderPID:  proc.PID,
+			Command:    proc.Command,
+			TTY:        proc.TTY,
+		}
+
+		if existing, ok := bySessionID[proc.SessionID]; ok {
+			bySessionID[proc.SessionID] = mergeExternalSession(existing, candidate)
+			continue
+		}
+		bySessionID[proc.SessionID] = candidate
+	}
+
+	result := make([]ExternalSessionResponse, 0, len(bySessionID))
+	for _, session := range bySessionID {
+		result = append(result, session)
+	}
+	sortExternalSessions(result)
+	return result, nil
+}
+
+func scanRunningCodexSessionsFromProc(procRoot string) ([]ExternalSessionResponse, error) {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	bySessionID := map[string]ExternalSessionResponse{}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+
+		command := readProcessCommand(procRoot, pid)
+		if command == "" {
+			continue
+		}
+
+		sessionID := sessionIDFromCodexResumeCommand(command)
+		if sessionID == "" {
+			continue
+		}
+
+		candidate := ExternalSessionResponse{
+			SessionID:  sessionID,
+			WorkDir:    readProcessCwd(procRoot, pid),
+			LastSeenAt: now,
+			Source:     "process",
+			IsRunning:  true,
+			LeaderPID:  pid,
+			Command:    command,
+			TTY:        readProcessTTY(procRoot, pid),
+		}
+
+		if existing, ok := bySessionID[sessionID]; ok {
+			bySessionID[sessionID] = mergeExternalSession(existing, candidate)
+			continue
+		}
+		bySessionID[sessionID] = candidate
+	}
+
+	result := make([]ExternalSessionResponse, 0, len(bySessionID))
+	for _, session := range bySessionID {
+		result = append(result, session)
+	}
+	sortExternalSessions(result)
+	return result, nil
+}
+
+func parseCodexResumeProcesses(psOutput string) []codexResumeProcess {
+	scanner := bufio.NewScanner(strings.NewReader(psOutput))
+	scanner.Buffer(make([]byte, 0, 256*1024), 2*1024*1024)
+
+	result := make([]codexResumeProcess, 0)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		ppid, _ := strconv.Atoi(fields[1])
+		tty := strings.TrimSpace(fields[2])
+		command := strings.TrimSpace(strings.Join(fields[3:], " "))
+		if command == "" {
+			continue
+		}
+
+		sessionID := sessionIDFromCodexResumeCommand(command)
+		if sessionID == "" {
+			continue
+		}
+
+		result = append(result, codexResumeProcess{
+			SessionID: sessionID,
+			PID:       pid,
+			PPID:      ppid,
+			TTY:       tty,
+			Command:   command,
+		})
+	}
+
+	return result
+}
+
+func sessionIDFromCodexResumeCommand(command string) string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return ""
+	}
+	lowerCommand := strings.ToLower(command)
+	if !strings.Contains(lowerCommand, "codex") || !strings.Contains(lowerCommand, "resume") {
+		return ""
+	}
+
+	match := codexResumeCommandSessionPattern.FindStringSubmatch(command)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(match[1]))
+}
+
+func readProcessCommand(procRoot string, pid int) string {
+	if procRoot == "" || pid <= 0 {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cmdline"))
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+
+	parts := strings.Split(string(raw), "\x00")
+	args := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		args = append(args, part)
+	}
+	if len(args) == 0 {
+		return ""
+	}
+	return strings.Join(args, " ")
+}
+
+func readProcessCwd(procRoot string, pid int) string {
+	if procRoot == "" || pid <= 0 {
+		return ""
+	}
+	cwd, err := os.Readlink(filepath.Join(procRoot, strconv.Itoa(pid), "cwd"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(cwd)
+}
+
+func readProcessTTY(procRoot string, pid int) string {
+	if procRoot == "" || pid <= 0 {
+		return ""
+	}
+	target, err := os.Readlink(filepath.Join(procRoot, strconv.Itoa(pid), "fd", "0"))
+	if err != nil {
+		return ""
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return ""
+	}
+	target = strings.TrimPrefix(target, "/dev/")
+	if strings.HasPrefix(target, "pts/") || target == "tty" || target == "console" {
+		return target
+	}
+	return ""
+}
+
+func mergeExternalSessions(groups ...[]ExternalSessionResponse) []ExternalSessionResponse {
+	bySessionID := map[string]ExternalSessionResponse{}
+
+	for _, group := range groups {
+		for _, candidate := range group {
+			candidate.SessionID = strings.TrimSpace(candidate.SessionID)
+			if candidate.SessionID == "" {
+				continue
+			}
+
+			if existing, ok := bySessionID[candidate.SessionID]; ok {
+				bySessionID[candidate.SessionID] = mergeExternalSession(existing, candidate)
+				continue
+			}
+			bySessionID[candidate.SessionID] = candidate
+		}
+	}
+
+	result := make([]ExternalSessionResponse, 0, len(bySessionID))
+	for _, session := range bySessionID {
+		result = append(result, session)
+	}
+	sortExternalSessions(result)
+	return result
+}
+
+func mergeExternalSession(existing ExternalSessionResponse, incoming ExternalSessionResponse) ExternalSessionResponse {
+	merged := existing
+
+	if merged.WorkDir == "" || (incoming.IsRunning && incoming.WorkDir != "") {
+		merged.WorkDir = incoming.WorkDir
+	}
+
+	if merged.IssueID == "" && incoming.IssueID != "" {
+		merged.IssueID = incoming.IssueID
+	}
+	if merged.SourceTaskID == "" && incoming.SourceTaskID != "" {
+		merged.SourceTaskID = incoming.SourceTaskID
+	}
+
+	if compareSessionTimes(incoming.LastSeenAt, merged.LastSeenAt) > 0 {
+		merged.LastSeenAt = incoming.LastSeenAt
+	}
+
+	merged.IsRunning = merged.IsRunning || incoming.IsRunning
+
+	if merged.LeaderPID == 0 || (incoming.LeaderPID > 0 && incoming.LeaderPID < merged.LeaderPID) {
+		merged.LeaderPID = incoming.LeaderPID
+	}
+	if merged.Command == "" && incoming.Command != "" {
+		merged.Command = incoming.Command
+	}
+	if merged.TTY == "" && incoming.TTY != "" {
+		merged.TTY = incoming.TTY
+	}
+
+	switch {
+	case merged.Source == "":
+		merged.Source = incoming.Source
+	case incoming.Source == "":
+	case merged.Source == incoming.Source:
+	default:
+		merged.Source = "merged"
+	}
+
+	return merged
+}
+
+func sortExternalSessions(sessions []ExternalSessionResponse) {
+	sort.Slice(sessions, func(i, j int) bool {
+		ti := parseSessionTimestamp(sessions[i].LastSeenAt)
+		tj := parseSessionTimestamp(sessions[j].LastSeenAt)
+		if ti.Equal(tj) {
+			return sessions[i].SessionID < sessions[j].SessionID
+		}
+		return ti.After(tj)
+	})
+}
+
+func parseSessionTimestamp(raw string) time.Time {
+	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
+}
+
+func compareSessionTimes(a, b string) int {
+	ta := parseSessionTimestamp(a)
+	tb := parseSessionTimestamp(b)
+	switch {
+	case ta.After(tb):
+		return 1
+	case ta.Before(tb):
+		return -1
+	default:
+		return 0
+	}
 }
 
 func parseCodexSessionFile(path string) (codexSessionRecord, bool) {

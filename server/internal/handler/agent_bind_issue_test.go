@@ -11,6 +11,21 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+type resumeErrorResponse struct {
+	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
+}
+
+func decodeResumeErrorResponse(t *testing.T, w *httptest.ResponseRecorder) resumeErrorResponse {
+	t.Helper()
+
+	var resp resumeErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode error response: %v (body=%q)", err, w.Body.String())
+	}
+	return resp
+}
+
 func withRouteParams(req *http.Request, params map[string]string) *http.Request {
 	rctx := chi.NewRouteContext()
 	for key, value := range params {
@@ -157,9 +172,16 @@ func TestResumeExternalSession_RejectsWhenWorkspaceHasNoRepos(t *testing.T) {
 	ctx := context.Background()
 	agentID, _ := mustLookupHandlerTestAgent(t)
 	sessionID := "019d96b0-288d-7bc3-9488-275af8d26876"
+	issueID := mustCreateIssueForWorkspace(t, "Resume should fail without repos")
+	setHandlerTestWorkspaceRepos(t, []map[string]string{})
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
+	})
 
 	req := newRequest("POST", "/api/agents/"+agentID+"/resume-session", map[string]any{
 		"session_id": sessionID,
+		"issue_id":   issueID,
 	})
 	req = withRouteParams(req, map[string]string{
 		"id": agentID,
@@ -188,5 +210,163 @@ func TestResumeExternalSession_RejectsWhenWorkspaceHasNoRepos(t *testing.T) {
 	}
 	if createdCount != 0 {
 		t.Fatalf("expected no resume task enqueued, got %d", createdCount)
+	}
+}
+
+func TestResumeExternalSession_RejectsMissingIssueID(t *testing.T) {
+	agentID, _ := mustLookupHandlerTestAgent(t)
+	sessionID := "019d96b2-4407-7291-9c75-355eb8a949d8"
+
+	req := newRequest("POST", "/api/agents/"+agentID+"/resume-session", map[string]any{
+		"session_id": sessionID,
+	})
+	req = withRouteParams(req, map[string]string{
+		"id": agentID,
+	})
+	w := httptest.NewRecorder()
+	testHandler.ResumeExternalSession(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("ResumeExternalSession: expected 400 for missing issue_id, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := decodeResumeErrorResponse(t, w)
+	if resp.Code != resumeErrorCodeIssueRequired {
+		t.Fatalf("ResumeExternalSession: expected code %q, got %q", resumeErrorCodeIssueRequired, resp.Code)
+	}
+	if !strings.Contains(strings.ToLower(resp.Error), "issue_id is required") {
+		t.Fatalf("ResumeExternalSession: expected issue_id required error, got %q", resp.Error)
+	}
+}
+
+func TestResumeExternalSession_RequiresRootPermissionAck(t *testing.T) {
+	ctx := context.Background()
+	agentID, _ := mustLookupHandlerTestAgent(t)
+	issueID := mustCreateIssueForWorkspace(t, "Resume root permission guard")
+
+	setHandlerTestWorkspaceRepos(t, []map[string]string{
+		{"url": "git@example.com:team/api.git", "description": "API"},
+	})
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+
+	req := newRequest("POST", "/api/agents/"+agentID+"/resume-session", map[string]any{
+		"session_id": "019d96b3-8fe1-7fd7-97af-9aaf70f8f1b2",
+		"issue_id":   issueID,
+		"work_dir":   "/root/project",
+	})
+	req = withRouteParams(req, map[string]string{
+		"id": agentID,
+	})
+	w := httptest.NewRecorder()
+	testHandler.ResumeExternalSession(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("ResumeExternalSession: expected 403 for root workdir without acknowledgement, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := decodeResumeErrorResponse(t, w)
+	if resp.Code != resumeErrorCodeRootPermission {
+		t.Fatalf("ResumeExternalSession: expected code %q, got %q", resumeErrorCodeRootPermission, resp.Code)
+	}
+	if !strings.Contains(strings.ToLower(resp.Error), "root permission") {
+		t.Fatalf("ResumeExternalSession: expected root permission error, got %q", resp.Error)
+	}
+}
+
+func TestResumeExternalSession_AllowsRootPermissionAck(t *testing.T) {
+	ctx := context.Background()
+	agentID, _ := mustLookupHandlerTestAgent(t)
+	issueID := mustCreateIssueForWorkspace(t, "Resume root permission accepted")
+	sessionID := "019d96b4-2cd7-7a33-a118-8d61f40fefaa"
+	var createdTaskID string
+
+	setHandlerTestWorkspaceRepos(t, []map[string]string{
+		{"url": "git@example.com:team/api.git", "description": "API"},
+	})
+
+	t.Cleanup(func() {
+		if createdTaskID != "" {
+			testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, createdTaskID)
+		}
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+
+	req := newRequest("POST", "/api/agents/"+agentID+"/resume-session", map[string]any{
+		"session_id":        sessionID,
+		"issue_id":          issueID,
+		"work_dir":          "/root/project",
+		"allow_root_resume": true,
+	})
+	req = withRouteParams(req, map[string]string{
+		"id": agentID,
+	})
+	w := httptest.NewRecorder()
+	testHandler.ResumeExternalSession(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("ResumeExternalSession: expected 201 for root workdir with acknowledgement, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp AgentTaskResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	createdTaskID = resp.ID
+	if createdTaskID == "" {
+		t.Fatalf("expected created task id in response")
+	}
+	if resp.IssueID != issueID {
+		t.Fatalf("expected issue_id %q, got %q", issueID, resp.IssueID)
+	}
+	if resp.ResumeSessionID != sessionID {
+		t.Fatalf("expected resume_session_id %q, got %q", sessionID, resp.ResumeSessionID)
+	}
+
+	var savedSessionID, savedWorkDir, savedRootAck string
+	if err := testPool.QueryRow(
+		ctx,
+		`SELECT
+			COALESCE(context->>'resume_session_id', ''),
+			COALESCE(context->>'resume_work_dir', ''),
+			COALESCE(context->>'root_permission_ack', '')
+		 FROM agent_task_queue
+		 WHERE id = $1`,
+		createdTaskID,
+	).Scan(&savedSessionID, &savedWorkDir, &savedRootAck); err != nil {
+		t.Fatalf("query created task context: %v", err)
+	}
+	if savedSessionID != sessionID {
+		t.Fatalf("expected stored resume_session_id %q, got %q", sessionID, savedSessionID)
+	}
+	if savedWorkDir != "/root/project" {
+		t.Fatalf("expected stored resume_work_dir %q, got %q", "/root/project", savedWorkDir)
+	}
+	if savedRootAck != "true" {
+		t.Fatalf("expected stored root_permission_ack true, got %q", savedRootAck)
+	}
+}
+
+func TestIsRootScopedWorkDir(t *testing.T) {
+	tests := []struct {
+		name    string
+		workDir string
+		want    bool
+	}{
+		{name: "empty", workDir: "", want: false},
+		{name: "spaces", workDir: "   ", want: false},
+		{name: "exact root", workDir: "/root", want: true},
+		{name: "root child", workDir: "/root/project", want: true},
+		{name: "root with backslashes", workDir: "\\root\\project", want: true},
+		{name: "non root", workDir: "/home/jacob/project", want: false},
+		{name: "root prefix only", workDir: "/rooted/project", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRootScopedWorkDir(tt.workDir); got != tt.want {
+				t.Fatalf("isRootScopedWorkDir(%q): expected %t, got %t", tt.workDir, tt.want, got)
+			}
+		})
 	}
 }
