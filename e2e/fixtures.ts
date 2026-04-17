@@ -23,7 +23,10 @@ export class TestApiClient {
   private token: string | null = null;
   private workspaceSlug: string | null = null;
   private workspaceId: string | null = null;
+  private userId: string | null = null;
   private createdIssueIds: string[] = [];
+  private createdAgentIds: string[] = [];
+  private createdRuntimeIds: string[] = [];
 
   async login(email: string, name: string) {
     const client = new pg.Client(DATABASE_URL);
@@ -64,6 +67,7 @@ export class TestApiClient {
       const data = await verifyRes.json();
 
       this.token = data.token;
+      this.userId = data.user?.id ?? null;
 
       // Update user name if needed
       if (name && data.user?.name !== name) {
@@ -147,10 +151,95 @@ export class TestApiClient {
       }
     }
     this.createdIssueIds = [];
+
+    const client = new pg.Client(DATABASE_URL);
+    await client.connect();
+    try {
+      for (const agentId of this.createdAgentIds) {
+        await client.query("DELETE FROM agent WHERE id = $1", [agentId]);
+      }
+      this.createdAgentIds = [];
+
+      for (const runtimeId of this.createdRuntimeIds) {
+        await client.query("DELETE FROM agent_runtime WHERE id = $1", [runtimeId]);
+      }
+      this.createdRuntimeIds = [];
+    } finally {
+      await client.end();
+    }
   }
 
   getToken() {
     return this.token;
+  }
+
+  getWorkspaceSlug() {
+    return this.workspaceSlug;
+  }
+
+  /**
+   * Ensure one codex runtime + one agent for UI tests that require Agents/Tasks views.
+   */
+  async ensureCodexAgentForE2E(namePrefix = "E2E Host Codex Agent"): Promise<{ agentId: string; runtimeId: string }> {
+    if (!this.workspaceId) {
+      throw new Error("workspace must be initialized before creating test agent");
+    }
+    if (!this.userId) {
+      throw new Error("user must be logged in before creating test agent");
+    }
+
+    const client = new pg.Client(DATABASE_URL);
+    await client.connect();
+    try {
+      const suffix = Date.now().toString();
+      const runtimeName = `E2E Codex Runtime ${suffix}`;
+      const agentName = `${namePrefix} ${suffix}`;
+
+      const runtimeRes = await client.query(
+        `INSERT INTO agent_runtime (
+          workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at
+        ) VALUES (
+          $1, $2, $3, 'cloud', 'codex', 'online', $4, '{}'::jsonb, $5, now()
+        ) RETURNING id`,
+        [
+          this.workspaceId,
+          `e2e-daemon-${suffix}`,
+          runtimeName,
+          "E2E runtime",
+          this.userId,
+        ],
+      );
+      const runtimeId = runtimeRes.rows[0]?.id as string;
+      if (!runtimeId) {
+        throw new Error("failed to create test runtime");
+      }
+
+      const agentRes = await client.query(
+        `INSERT INTO agent (
+          workspace_id, name, description, instructions, runtime_mode, runtime_config,
+          runtime_id, visibility, status, max_concurrent_tasks, owner_id, custom_env, custom_args
+        ) VALUES (
+          $1, $2, '', '', 'cloud', '{}'::jsonb,
+          $3, 'workspace', 'idle', 2, $4, '{}'::jsonb, '[]'::jsonb
+        ) RETURNING id`,
+        [
+          this.workspaceId,
+          agentName,
+          runtimeId,
+          this.userId,
+        ],
+      );
+      const agentId = agentRes.rows[0]?.id as string;
+      if (!agentId) {
+        throw new Error("failed to create test agent");
+      }
+
+      this.createdRuntimeIds.push(runtimeId);
+      this.createdAgentIds.push(agentId);
+      return { agentId, runtimeId };
+    } finally {
+      await client.end();
+    }
   }
 
   private async authedFetch(path: string, init?: RequestInit) {

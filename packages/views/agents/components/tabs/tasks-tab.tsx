@@ -1,10 +1,22 @@
 "use client";
 
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
-import { ListTodo, RotateCcw, Copy } from "lucide-react";
-import type { Agent, AgentExternalSession, AgentTask } from "@multica/core/types";
+import { ListTodo, RotateCcw, Copy, ShieldAlert } from "lucide-react";
+import type {
+  Agent,
+  AgentExternalSession,
+  AgentHostCodexElevation,
+  AgentTask,
+} from "@multica/core/types";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import { Button } from "@multica/ui/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@multica/ui/components/ui/dialog";
 import { api } from "@multica/core/api";
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
@@ -19,6 +31,9 @@ type ResumeEntry = {
   issue_id?: string;
   source_task_id?: string;
   source: "task" | "external";
+  external_source?: AgentExternalSession["source"];
+  is_running?: boolean;
+  leader_pid?: number;
   timestamp: string;
 };
 
@@ -62,6 +77,26 @@ function isAlreadyBoundTaskConflict(error: unknown): boolean {
   return message.includes("already bound") || message.includes("cannot be bound");
 }
 
+function normalizeWorkDirPath(workDir?: string): string {
+  return (workDir || "").trim().replace(/\\/g, "/");
+}
+
+function isRootScopedWorkDir(workDir?: string): boolean {
+  const normalized = normalizeWorkDirPath(workDir);
+  return normalized === "/root" || normalized.startsWith("/root/");
+}
+
+function isRootPermissionRequiredError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const maybeError = error as { status?: number; message?: string };
+  const message = (maybeError.message || "").toLowerCase();
+  return (
+    message.includes("root permission") ||
+    message.includes("root work directory") ||
+    (maybeError.status === 403 && message.includes("/root"))
+  );
+}
+
 function resolveTaskResumeCommand(task: AgentTask): string | null {
   const explicitCommand = (task.resume_command || "").trim();
   if (explicitCommand) return explicitCommand;
@@ -90,7 +125,11 @@ function isActiveTaskStatus(status: AgentTask["status"]): boolean {
 export function TasksTab({ agent }: { agent: Agent }) {
   const [tasks, setTasks] = useState<AgentTask[]>([]);
   const [externalSessions, setExternalSessions] = useState<AgentExternalSession[]>([]);
+  const [hostCodexElevation, setHostCodexElevation] = useState<AgentHostCodexElevation | null>(null);
   const [loading, setLoading] = useState(true);
+  const [hostCodexEnabling, setHostCodexEnabling] = useState(false);
+  const [hostCodexDisabling, setHostCodexDisabling] = useState(false);
+  const [hostCodexLogOpen, setHostCodexLogOpen] = useState(false);
   const [resumingSessionIds, setResumingSessionIds] = useState<Record<string, boolean>>({});
   const [issueBindingBySession, setIssueBindingBySession] = useState<Record<string, string>>({});
   const inFlightResumeSessionsRef = useRef<Set<string>>(new Set());
@@ -109,16 +148,19 @@ export function TasksTab({ agent }: { agent: Agent }) {
       setLoading(true);
     }
     try {
-      const [taskList, externalList] = await Promise.all([
+      const [taskList, externalList, hostCodexStatus] = await Promise.all([
         api.listAgentTasks(agent.id),
         api.listAgentExternalSessions(agent.id, { days: 7 }),
+        api.getAgentHostCodexElevation(agent.id),
       ]);
       setTasks(taskList);
       setExternalSessions(externalList);
+      setHostCodexElevation(hostCodexStatus);
     } catch {
       if (!background) {
         setTasks([]);
         setExternalSessions([]);
+        setHostCodexElevation(null);
       }
     } finally {
       if (!background) {
@@ -232,6 +274,9 @@ export function TasksTab({ agent }: { agent: Agent }) {
         issue_id: external.issue_id,
         source_task_id: external.source_task_id,
         source: "external",
+        external_source: external.source,
+        is_running: external.is_running === true,
+        leader_pid: external.leader_pid,
         timestamp: external.last_seen_at,
       });
     }
@@ -250,13 +295,24 @@ export function TasksTab({ agent }: { agent: Agent }) {
 
     for (const task of taskCandidates) {
       const sessionId = task.session_id!;
+      const existing = bySession.get(sessionId);
+      const taskTimestamp = task.completed_at ?? task.created_at;
+      const existingTimestamp = existing?.timestamp || "";
+      const resolvedTimestamp =
+        Date.parse(taskTimestamp) >= Date.parse(existingTimestamp || "1970-01-01T00:00:00Z")
+          ? taskTimestamp
+          : existingTimestamp;
+
       bySession.set(sessionId, {
         session_id: sessionId,
-        work_dir: task.work_dir,
-        issue_id: task.issue_id || undefined,
+        work_dir: task.work_dir || existing?.work_dir,
+        issue_id: task.issue_id || existing?.issue_id || undefined,
         source_task_id: task.id,
         source: "task",
-        timestamp: task.completed_at ?? task.created_at,
+        external_source: existing?.external_source,
+        is_running: existing?.is_running,
+        leader_pid: existing?.leader_pid,
+        timestamp: resolvedTimestamp,
       });
     }
 
@@ -440,6 +496,61 @@ export function TasksTab({ agent }: { agent: Agent }) {
     }
   };
 
+  const copyText = async (text: string, successMessage: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success(successMessage);
+    } catch {
+      toast.error("Failed to copy text");
+    }
+  };
+
+  const handleEnableHostCodexElevation = async () => {
+    setHostCodexEnabling(true);
+    try {
+      const status = await api.enableAgentHostCodexElevation(agent.id);
+      setHostCodexElevation(status);
+      if (status.enabled) {
+        toast.success("Elevated host-codex mode is enabled.");
+        await loadData({ background: true });
+        return;
+      }
+
+      if (status.message) {
+        toast.info(status.message);
+      } else {
+        toast.info("Automatic enable is unavailable. Run the provided command on the self-host machine.");
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to enable host-codex elevation");
+    } finally {
+      setHostCodexEnabling(false);
+    }
+  };
+
+  const handleDisableHostCodexElevation = async () => {
+    setHostCodexDisabling(true);
+    try {
+      const status = await api.disableAgentHostCodexElevation(agent.id);
+      setHostCodexElevation(status);
+      if (!status.enabled) {
+        toast.success("Host-codex elevated mode is disabled.");
+        await loadData({ background: true });
+        return;
+      }
+
+      if (status.message) {
+        toast.info(status.message);
+      } else {
+        toast.info("Disable command was executed. Refresh to confirm mode.");
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to disable host-codex elevation");
+    } finally {
+      setHostCodexDisabling(false);
+    }
+  };
+
   const handleResume = async (entry: ResumeEntry) => {
     if (inFlightResumeSessionsRef.current.has(entry.session_id)) {
       toast.info("This session is already queueing.");
@@ -456,6 +567,21 @@ export function TasksTab({ agent }: { agent: Agent }) {
       const selectedIssueId = issueBindingBySession[entry.session_id];
       const command = `codex resume ${entry.session_id}`;
       let effectiveIssueID = entry.issue_id || selectedIssueId;
+      let allowRootResume = false;
+
+      if (isRootScopedWorkDir(entry.work_dir)) {
+        const confirmed = window.confirm(
+          `This session workdir is under /root (${entry.work_dir}).\n\n` +
+          `Continuing may require elevated privileges and can touch privileged files.\n` +
+          `Only continue if you trust this session context.\n\n` +
+          `Press OK to acknowledge and continue, or Cancel to stop.`,
+        );
+        if (!confirmed) {
+          toast.info("Continue cancelled. Root-privileged resume was not started.");
+          return;
+        }
+        allowRootResume = true;
+      }
 
       if (entry.issue_id && !selectedIssueId) {
         const existingIssue = issueMap.get(entry.issue_id);
@@ -520,6 +646,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
           session_id: entry.session_id,
           work_dir: entry.work_dir,
           issue_id: effectiveIssueID,
+          allow_root_resume: allowRootResume,
         });
       } catch (resumeErr) {
         if (!isPendingTaskConflict(resumeErr)) {
@@ -552,11 +679,18 @@ export function TasksTab({ agent }: { agent: Agent }) {
           session_id: entry.session_id,
           work_dir: entry.work_dir,
           issue_id: effectiveIssueID,
+          allow_root_resume: allowRootResume,
         });
       }
       toast.success("Resume task queued");
       await loadData({ background: true });
     } catch (e) {
+      if (isRootPermissionRequiredError(e)) {
+        toast.error(
+          "Root permission is required for this session workdir. Run the runtime with root privileges (or move session/workdir to a non-root path) and retry.",
+        );
+        return;
+      }
       toast.error(e instanceof Error ? e.message : "Failed to queue resume task");
     } finally {
       inFlightResumeSessionsRef.current.delete(entry.session_id);
@@ -607,14 +741,97 @@ export function TasksTab({ agent }: { agent: Agent }) {
           </span>
         </div>
 
+        {hostCodexElevation && (
+          <div
+            className={`mb-3 rounded-md border p-2.5 ${
+              hostCodexElevation.enabled
+                ? "border-emerald-300/70 bg-emerald-50"
+                : "border-amber-300/70 bg-amber-50"
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-xs font-medium">
+                  <ShieldAlert className="h-3.5 w-3.5" />
+                  Host Codex Elevation
+                  <span className="rounded border px-1 py-0.5 text-[10px] uppercase tracking-wide">
+                    {hostCodexElevation.mode}
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  {hostCodexElevation.message || "Enable elevated mode to let backend discover host codex processes."}
+                </p>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setHostCodexLogOpen(true)}
+                >
+                  View Logs
+                </Button>
+                {!hostCodexElevation.enabled && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={hostCodexEnabling}
+                    onClick={handleEnableHostCodexElevation}
+                  >
+                    {hostCodexEnabling ? "Enabling..." : "Enable Elevated"}
+                  </Button>
+                )}
+                {hostCodexElevation.enabled && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={hostCodexDisabling}
+                    onClick={handleDisableHostCodexElevation}
+                  >
+                    {hostCodexDisabling ? "Disabling..." : "Disable Elevated"}
+                  </Button>
+                )}
+                {hostCodexElevation.enable_command && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => copyText(hostCodexElevation.enable_command!, "Enable command copied")}
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    Copy Cmd
+                  </Button>
+                )}
+                {hostCodexElevation.disable_command && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => copyText(hostCodexElevation.disable_command!, "Disable command copied")}
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    Copy Disable
+                  </Button>
+                )}
+              </div>
+            </div>
+            {hostCodexElevation.enable_command && !hostCodexElevation.enabled && (
+              <code
+                className="mt-2 block overflow-x-auto rounded border bg-background px-2 py-1.5 font-mono text-[10px]"
+                title={hostCodexElevation.enable_command}
+              >
+                {hostCodexElevation.enable_command}
+              </code>
+            )}
+          </div>
+        )}
+
         {resumeEntries.length === 0 ? (
           <div className="space-y-1">
             <p className="text-xs text-muted-foreground">
               No resumable sessions from the last 7 days.
             </p>
             <p className="text-[11px] text-muted-foreground">
-              If sessions exist on host, mount host <code>~/.codex</code> into backend and set{" "}
-              <code>MULTICA_CODEX_SESSIONS_ROOT</code>.
+              If sessions exist on host, mount host <code>~/.codex</code> and set{" "}
+              <code>MULTICA_CODEX_SESSIONS_ROOT</code>. Live process detection also requires Linux runtime
+              access to <code>ps</code>/<code>/proc</code>.
             </p>
           </div>
         ) : (
@@ -635,6 +852,21 @@ export function TasksTab({ agent }: { agent: Agent }) {
                       <span className="rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                         {entry.source}
                       </span>
+                      {entry.external_source && entry.source === "external" && (
+                        <span className="rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                          {entry.external_source}
+                        </span>
+                      )}
+                      {entry.is_running && (
+                        <span className="rounded border border-emerald-300/70 bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-700">
+                          running
+                        </span>
+                      )}
+                      {isRootScopedWorkDir(entry.work_dir) && (
+                        <span className="rounded border border-amber-300/70 bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700">
+                          root
+                        </span>
+                      )}
                       {issue ? (
                         <span className="truncate text-xs text-muted-foreground">
                           {issue.identifier} - {issue.title}
@@ -646,7 +878,11 @@ export function TasksTab({ agent }: { agent: Agent }) {
                       )}
                     </div>
                     <div className="mt-0.5 text-[11px] text-muted-foreground">
-                      {entry.source === "task" ? "Completed" : "Last seen"}{" "}
+                      {entry.is_running
+                        ? `Running${entry.leader_pid ? ` (PID ${entry.leader_pid})` : ""}`
+                        : entry.source === "task"
+                          ? "Completed"
+                          : "Last seen"}{" "}
                       {new Date(entry.timestamp).toLocaleString()}
                     </div>
                     {!entry.issue_id && !entry.source_task_id && (
@@ -663,7 +899,7 @@ export function TasksTab({ agent }: { agent: Agent }) {
                             }))
                           }
                         >
-                          <option value="">Tasks only (no issue)</option>
+                          <option value="">Auto-create issue if needed</option>
                           {bindableIssues.map((bindIssue) => (
                             <option key={bindIssue.id} value={bindIssue.id}>
                               {bindIssue.identifier} - {bindIssue.title}
@@ -771,6 +1007,51 @@ export function TasksTab({ agent }: { agent: Agent }) {
             );
           })}
         </div>
+      )}
+
+      {hostCodexElevation && (
+        <Dialog open={hostCodexLogOpen} onOpenChange={setHostCodexLogOpen}>
+          <DialogContent className="max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>Host Codex Elevation Logs</DialogTitle>
+              <DialogDescription>
+                Last elevated-mode operation and command output.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-2 text-xs">
+              <div className="grid grid-cols-[120px_1fr] gap-2">
+                <span className="text-muted-foreground">Last action</span>
+                <span>{hostCodexElevation.last_action || "(none)"}</span>
+              </div>
+              <div className="grid grid-cols-[120px_1fr] gap-2">
+                <span className="text-muted-foreground">At</span>
+                <span>
+                  {hostCodexElevation.last_action_at
+                    ? new Date(hostCodexElevation.last_action_at).toLocaleString()
+                    : "(none)"}
+                </span>
+              </div>
+              <div className="grid grid-cols-[120px_1fr] gap-2">
+                <span className="text-muted-foreground">Command</span>
+                <code className="block overflow-x-auto rounded border bg-muted px-2 py-1 font-mono text-[11px]">
+                  {hostCodexElevation.last_command || "(none)"}
+                </code>
+              </div>
+              <div className="grid grid-cols-[120px_1fr] gap-2">
+                <span className="text-muted-foreground">Output</span>
+                <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded border bg-background px-2 py-1 font-mono text-[11px]">
+                  {hostCodexElevation.last_output || "(no output)"}
+                </pre>
+              </div>
+              <div className="grid grid-cols-[120px_1fr] gap-2">
+                <span className="text-muted-foreground">Error</span>
+                <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded border bg-background px-2 py-1 font-mono text-[11px] text-destructive">
+                  {hostCodexElevation.last_error || "(none)"}
+                </pre>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
       )}
     </div>
   );
