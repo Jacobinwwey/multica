@@ -1,4 +1,4 @@
-.PHONY: dev server daemon cli multica build test migrate-up migrate-down sqlc seed clean setup start stop check worktree-env setup-main start-main stop-main check-main setup-worktree start-worktree stop-worktree check-worktree db-up db-down selfhost selfhost-stop
+.PHONY: dev server daemon cli multica build test migrate-up migrate-down sqlc seed clean setup start stop check worktree-env setup-main start-main stop-main check-main setup-worktree start-worktree stop-worktree check-worktree db-up db-down selfhost selfhost-stop selfhost-host-codex selfhost-host-codex-stop
 
 MAIN_ENV_FILE ?= .env
 WORKTREE_ENV_FILE ?= .env.worktree
@@ -81,6 +81,47 @@ selfhost:
 selfhost-stop:
 	@echo "==> Stopping Multica services..."
 	docker compose -f docker-compose.selfhost.yml down
+	@echo "✓ All services stopped."
+
+# Self-host with host Codex process visibility (Linux).
+# This mode mounts host /proc read-only into backend.
+selfhost-host-codex:
+	@if [ ! -f .env ]; then \
+		echo "==> Creating .env from .env.example..."; \
+		cp .env.example .env; \
+		JWT=$$(openssl rand -hex 32); \
+		if [ "$$(uname)" = "Darwin" ]; then \
+			sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
+		else \
+			sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
+		fi; \
+		echo "==> Generated random JWT_SECRET"; \
+	fi
+	@echo "==> Starting Multica with host-codex visibility override..."
+	docker compose -f docker-compose.selfhost.yml -f docker-compose.selfhost.host-codex.yml up -d --build
+	@echo "==> Waiting for backend to be ready..."
+	@for i in $$(seq 1 30); do \
+		if curl -sf http://localhost:$${PORT:-8080}/health > /dev/null 2>&1; then \
+			break; \
+		fi; \
+		sleep 2; \
+	done
+	@if curl -sf http://localhost:$${PORT:-8080}/health > /dev/null 2>&1; then \
+		echo ""; \
+		echo "✓ Multica is running (host-codex mode)!"; \
+		echo "  Frontend: http://localhost:$${FRONTEND_PORT:-3000}"; \
+		echo "  Backend:  http://localhost:$${PORT:-8080}"; \
+		echo ""; \
+		echo "Log in with any email + verification code: 888888"; \
+	else \
+		echo ""; \
+		echo "Services are still starting. Check logs:"; \
+		echo "  docker compose -f docker-compose.selfhost.yml -f docker-compose.selfhost.host-codex.yml logs"; \
+	fi
+
+selfhost-host-codex-stop:
+	@echo "==> Stopping Multica services (host-codex mode)..."
+	docker compose -f docker-compose.selfhost.yml -f docker-compose.selfhost.host-codex.yml down
 	@echo "✓ All services stopped."
 
 # ---------- One-click commands ----------
