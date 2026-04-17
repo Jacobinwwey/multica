@@ -51,6 +51,30 @@ export interface AgentExternalSession {
   last_seen_at: string;
   issue_id?: string;
   source_task_id?: string;
+  source?: "session_file" | "process" | "merged";
+  is_running?: boolean;
+  leader_pid?: number;
+  command?: string;
+  tty?: string;
+}
+
+export interface AgentHostCodexElevation {
+  enabled: boolean;
+  mode: "standard" | "elevated" | string;
+  can_auto_enable: boolean;
+  auto_enable_attempted?: boolean;
+  auto_enable_applied?: boolean;
+  requires_restart?: boolean;
+  proc_root?: string;
+  session_root?: string;
+  enable_command?: string;
+  disable_command?: string;
+  last_action?: "enable" | "disable" | string;
+  last_command?: string;
+  last_output?: string;
+  last_error?: string;
+  last_action_at?: string;
+  message?: string;
 }
 
 export interface Agent {

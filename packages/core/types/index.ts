@@ -6,6 +6,7 @@ export type {
   AgentVisibility,
   AgentTask,
   AgentExternalSession,
+  AgentHostCodexElevation,
   AgentRuntime,
   RuntimeDevice,
   CreateAgentRequest,

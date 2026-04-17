@@ -14,6 +14,7 @@ import type {
   UpdateAgentRequest,
   AgentTask,
   AgentExternalSession,
+  AgentHostCodexElevation,
   AgentRuntime,
   InboxItem,
   IssueSubscriber,
@@ -490,9 +491,25 @@ export class ApiClient {
     });
   }
 
+  async getAgentHostCodexElevation(agentId: string): Promise<AgentHostCodexElevation> {
+    return this.fetch(`/api/agents/${agentId}/host-codex-elevation`);
+  }
+
+  async enableAgentHostCodexElevation(agentId: string): Promise<AgentHostCodexElevation> {
+    return this.fetch(`/api/agents/${agentId}/host-codex-elevation/enable`, {
+      method: "POST",
+    });
+  }
+
+  async disableAgentHostCodexElevation(agentId: string): Promise<AgentHostCodexElevation> {
+    return this.fetch(`/api/agents/${agentId}/host-codex-elevation/disable`, {
+      method: "POST",
+    });
+  }
+
   async resumeAgentExternalSession(
     agentId: string,
-    data: { session_id: string; work_dir?: string; issue_id?: string; priority?: number },
+    data: { session_id: string; work_dir?: string; issue_id?: string; priority?: number; allow_root_resume?: boolean },
   ): Promise<AgentTask> {
     return this.fetch(`/api/agents/${agentId}/resume-session`, {
       method: "POST",

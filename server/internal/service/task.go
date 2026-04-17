@@ -503,6 +503,9 @@ func (s *TaskService) broadcastTaskEvent(ctx context.Context, eventType string, 
 		"issue_id": util.UUIDToString(task.IssueID),
 		"status":   task.Status,
 	}
+	if task.Error.Valid && task.Error.String != "" {
+		payload["error"] = task.Error.String
+	}
 	if task.ChatSessionID.Valid {
 		payload["chat_session_id"] = util.UUIDToString(task.ChatSessionID)
 	}
