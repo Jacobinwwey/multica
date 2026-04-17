@@ -141,6 +141,7 @@ function formatActivity(
     case "task_completed":
       return "completed the task";
     case "task_failed":
+      if (details.error) return `task failed: ${details.error}`;
       return "task failed";
     default:
       return entry.action ?? "";

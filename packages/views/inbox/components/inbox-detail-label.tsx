@@ -81,6 +81,11 @@ export function InboxDetailLabel({ item }: { item: InboxItem }) {
       if (item.body) return <span>{item.body}</span>;
       return <span>{typeLabels[item.type]}</span>;
     }
+    case "task_failed": {
+      if (item.body) return <span>{item.body}</span>;
+      if (details.task_error) return <span>Task failed: {details.task_error}</span>;
+      return <span>{typeLabels[item.type]}</span>;
+    }
     case "reaction_added": {
       const emoji = details.emoji;
       if (emoji) return <span>Reacted {emoji} to your comment</span>;
